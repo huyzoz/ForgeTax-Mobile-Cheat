@@ -145,6 +145,11 @@ jobs:
         # (no file picker), so the workflow publishes the finished IPA
         # itself on the repo it runs on (the huyzoz build fork).
         # Uses the default GITHUB_TOKEN (needs contents: write).
+                # gh needs the token as GH_TOKEN in the step env — without it gh
+                        # exits 4 ("set the GH_TOKEN environment variable").
+                                env:
+                                          GH_TOKEN: ${{ github.token }}
+                
         run: |
           if gh release view v3.16.1-cheat >/dev/null 2>&1; then
             gh release upload v3.16.1-cheat --clobber \
