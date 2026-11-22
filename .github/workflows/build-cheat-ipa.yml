@@ -78,7 +78,7 @@ jobs:
 
       - name: Inject dylib load command (LIEF)
         run: |
-          python3 -m pip install lief
+          python3 -m pip install --break-system-packages lief
           python3 scripts/inject_dylib.py "work/$APP" "@executable_path/Frameworks/ForgeTaxCheat.dylib"
           mkdir -p "work/$APP/Frameworks"
           cp ForgeTaxCheat.dylib "work/$APP/Frameworks/ForgeTaxCheat.dylib"
