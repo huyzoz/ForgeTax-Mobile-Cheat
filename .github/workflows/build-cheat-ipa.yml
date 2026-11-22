@@ -146,7 +146,7 @@ jobs:
         # itself on the repo it runs on (the huyzoz build fork).
         # Uses the default GITHUB_TOKEN (needs contents: write).
         run: |
-  export GH_TOKEN="${{ github.token }}"
+          export GH_TOKEN="${{ github.token }}"
           if gh release view v3.16.1-cheat >/dev/null 2>&1; then
             gh release upload v3.16.1-cheat --clobber \
               ForgeTax-Cheat-3.16.1.ipa ForgeTax-Cheat-3.16.1.ipa.sha256
