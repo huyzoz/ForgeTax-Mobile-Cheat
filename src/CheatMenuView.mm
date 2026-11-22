@@ -75,6 +75,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 @property (nonatomic, assign) BOOL engineOpen;
 @property (nonatomic, assign) BOOL settingOpen;
 @property (nonatomic, assign) NSInteger currentDay;
+@property (nonatomic, assign) CGSize lastLayoutSize;
 @end
 
 @implementation CheatMenuView
@@ -324,8 +325,13 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         CGRect f = self.logoButton.frame;
         f.origin.x = MAX(kMargin, MIN(f.origin.x, self.bounds.size.width - kLogoSize - kMargin));
         f.origin.y = MAX(kMargin, MIN(f.origin.y, self.bounds.size.height - kLogoSize - kMargin));
-        self.logoButton.frame = f;
-        [self layoutPanel];
+                self.logoButton.frame = f;
+                // Only reposition the panel when the size actually changed: this
+                // keeps layoutSubviews idempotent and kills any layout loop.
+                if (!CGSizeEqualToSize(self.bounds.size, self.lastLayoutSize)) {
+                                self.lastLayoutSize = self.bounds.size;
+                                [self layoutPanel];
+                }
     } @catch (...) {}
 }
 
@@ -341,18 +347,19 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
                                      self.bounds.size.width - pw - kMargin));
         self.panel.frame = CGRectMake(x, y, pw, ph);
 
-        // Header layout inside the panel.
-        UILabel *title = (UILabel *)[self.panel viewWithTag:1001];
-        title.frame = CGRectMake(0, 10, pw, 30);
-        CGFloat pillW = (pw - 32 - 16) / 3.0;
-        for (NSInteger i = 0; i < 3; i++) {
-            UIView *pill = [self.panel viewWithTag:2000 + i];
-            pill.frame = CGRectMake(16 + i * (pillW + 8), 46, pillW, 44);
-            UILabel *v = (UILabel *)[pill viewWithTag:2100 + i];
-            UILabel *l = (UILabel *)[pill viewWithTag:2200 + i];
-            v.frame = CGRectMake(0, 5, pillW, 17);
-            l.frame = CGRectMake(0, 23, pillW, 15);
-        }
+                // Header layout inside the panel.
+                UILabel *title = (UILabel *)[self.panel viewWithTag:1001];
+                if (title) title.frame = CGRectMake(0, 10, pw, 30);
+                CGFloat pillW = (pw - 32 - 16) / 3.0;
+                for (NSInteger i = 0; i < 3; i++) {
+                                UIView *pill = [self.panel viewWithTag:2000 + i];
+                                if (!pill) continue;
+                                pill.frame = CGRectMake(16 + i * (pillW + 8), 46, pillW, 44);
+                                UILabel *v = (UILabel *)[pill viewWithTag:2100 + i];
+                                UILabel *l = (UILabel *)[pill viewWithTag:2200 + i];
+                                if (v) v.frame = CGRectMake(0, 5, pillW, 17);
+                                if (l) l.frame = CGRectMake(0, 23, pillW, 15);
+                }
         self.scrollView.frame = CGRectMake(0, 98, pw, ph - 98 - 8);
         self.stackView.frame = CGRectMake(10, 0, pw - 20, self.stackView.frame.size.height);
         self.scrollView.contentSize = CGSizeMake(pw - 20, self.stackView.frame.size.height);
@@ -362,15 +369,20 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
     } @catch (...) {}
 }
 
+// Opening must never be able to kill the game: the content is already
+// built at attach time (attachToWindow) and every in-panel interaction
+// rebuilds it itself, so opening only unhides + repositions. Rebuilding
+// the whole hierarchy synchronously inside the tap handler crashed the
+// game on first open (run #6 live test), so it is deliberately NOT done
+// here anymore.
 - (void)setMenuOpen:(BOOL)open {
-    self.menuOpen = open;
-    self.panel.hidden = !open;
-    self.logoButton.layer.borderColor = open ? FTC_Color(FTC_C_GOLD).CGColor
-                                             : FTC_Color(FTC_C_GOLD3).CGColor;
-    if (open) {
-        [self rebuildContent];
-        [self layoutPanel];
-    }
+        @try {
+                    self.menuOpen = open;
+                    self.panel.hidden = !open;
+                    self.logoButton.layer.borderColor = open ? FTC_Color(FTC_C_GOLD).CGColor
+                                                                         : FTC_Color(FTC_C_GOLD3).CGColor;
+                    if (open) [self layoutPanel];
+        } @catch (...) { /* opening must never crash the game */ }
 }
 
 #pragma mark - Content building (only on interaction)
