@@ -8,7 +8,9 @@
 # Hard guarantees:
 #  - UnityFramework is NEVER modified: its SHA-256 is asserted identical
 #    before injection and after repacking; any difference fails the job.
-#  - The dylib is built directly with clang (no Xcode project to drift).
+#  - The dylib is built directly with clang++ (no Xcode project to drift).
+#    clang++ (not clang): the .mm sources use C++ exceptions (try/catch in
+#    GameBridge), so the C++ runtime (libc++) must be linked in.
 #  - patch_table.h must be in sync with patch_table_verified.json
 #    (regenerated and diffed); a drift fails the job.
 name: build-cheat-ipa
@@ -33,7 +35,7 @@ jobs:
 
       - name: Build ForgeTaxCheat.dylib (arm64, iOS 15.0)
         run: |
-          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=15.0 \
+          xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=15.0 \
             -dynamiclib -fobjc-arc -O2 -Wall \
             -install_name @executable_path/Frameworks/ForgeTaxCheat.dylib \
             -framework Foundation -framework UIKit \
