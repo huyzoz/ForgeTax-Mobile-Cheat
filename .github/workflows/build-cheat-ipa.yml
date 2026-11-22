@@ -74,7 +74,7 @@ jobs:
           APP=$(ls -d Payload/*.app)
           echo "APP=$APP" >> $GITHUB_ENV
           # Record UnityFramework hash BEFORE any modification.
-          shasum -a 256 "$APP/Frameworks/UnityFramework.framework/UnityFramework" | tee ../unity-before.txt
+          shasum -a 256 "$APP/Frameworks/UnityFramework.framework/UnityFramework" | awk '{print $1}' | tee ../unity-before.txt
 
       - name: Inject dylib load command (LIEF)
         run: |
@@ -85,7 +85,7 @@ jobs:
 
       - name: Assert UnityFramework unchanged
         run: |
-          shasum -a 256 "work/$APP/Frameworks/UnityFramework.framework/UnityFramework" | tee unity-after.txt
+          shasum -a 256 "work/$APP/Frameworks/UnityFramework.framework/UnityFramework" | awk '{print $1}' | tee unity-after.txt
           diff unity-before.txt unity-after.txt || {
             echo "::error::UnityFramework changed during the build — refusing to ship."
             exit 1
