@@ -71,7 +71,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *modeIndex;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *statusText;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *catOpen;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *descOpen;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *descOpen;
 @property (nonatomic, assign) BOOL engineOpen;
 @property (nonatomic, assign) BOOL settingOpen;
 @property (nonatomic, assign) NSInteger currentDay;
