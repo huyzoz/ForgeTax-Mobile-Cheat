@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdint.h>
 
 // ---- Minimal IL2CPP declarations (opaque; we never touch internals) ----
 typedef struct Il2CppDomain Il2CppDomain;
