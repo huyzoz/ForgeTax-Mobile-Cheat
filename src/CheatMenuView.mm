@@ -173,8 +173,12 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
     flameLayer.frame = CGRectMake((kLogoSize - 28) / 2.0, (kLogoSize - 28) / 2.0, 28, 28);
     [logo.layer addSublayer:flameLayer];
 
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(onLogoTap:)];
+    [logo addGestureRecognizer:tap];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onLogoPan:)];
+    [pan requireGestureRecognizerToFail:tap];
     [logo addGestureRecognizer:pan];
     [self addSubview:logo];
     self.logoButton = logo;
@@ -192,6 +196,16 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
     fps.hidden = YES;
     [self addSubview:fps];
     self.fpsBadge = fps;
+}
+
+// A tap is a tap: the pan recognizer FAILS on a stationary touch, so it
+// can never be the toggle. The tap recognizer owns open/close.
+- (void)onLogoTap:(UITapGestureRecognizer *)tap {
+    @try {
+        if (tap.state == UIGestureRecognizerStateEnded) {
+            [self setMenuOpen:!self.menuOpen];
+        }
+    } @catch (...) { /* toggle must never crash the game */ }
 }
 
 - (void)onLogoPan:(UIPanGestureRecognizer *)pan {
@@ -214,9 +228,6 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
             }
         } else if (pan.state == UIGestureRecognizerStateEnded ||
                    pan.state == UIGestureRecognizerStateCancelled) {
-            if (!self.dragMoved) {
-                [self setMenuOpen:!self.menuOpen];
-            }
             [self layoutPanel];
         }
     } @catch (...) { /* drag must never crash the game */ }
@@ -294,6 +305,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         if (!window) return;
         self.frame = window.bounds;
         if (self.superview != window) [window addSubview:self];
+        [window bringSubviewToFront:self];        
         // Initial position: top-right (mockup default).
         if (self.logoButton.frame.origin.x == 0 && self.logoButton.frame.origin.y == 0) {
             self.logoButton.frame = CGRectMake(window.bounds.size.width - kLogoSize - 16, 16,
@@ -307,6 +319,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 - (void)layoutSubviews {
     [super layoutSubviews];
     @try {
+        if (self.superview) [self.superview bringSubviewToFront:self];        
         // Keep the logo inside the window after rotation / resize.
         CGRect f = self.logoButton.frame;
         f.origin.x = MAX(kMargin, MIN(f.origin.x, self.bounds.size.width - kLogoSize - kMargin));
