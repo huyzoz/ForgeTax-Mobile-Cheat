@@ -1,13 +1,6 @@
-// GameBridge.mm — IL2CPP runtime calls. See GameBridge.h for the design
-// and the banned-methods note. All calls go through il2cpp_runtime_invoke
-// (no raw function-pointer calls, no MethodInfo* hacks). Every call is
-// wrapped in try/catch and null-checked; a failure returns an error code
-// and the menu shows "chua goi duoc" — results are never faked.
-//
-// il2cpp function pointers are resolved with dlsym(RTLD_DEFAULT) lazily;
-// because the thin iOS launcher loads UnityFramework dynamically, lookup
-// retries until UnityFramework's exports are present instead of latching
-// a permanent failure.
+// GameBridge.mm — IL2CPP runtime calls. See GameBridge.h for the design.
+// All calls go through il2cpp_runtime_invoke / il2cpp_field_{get,set}_value
+// with full null checks and try/catch guards.
 #import "GameBridge.h"
 
 #include <dlfcn.h>
@@ -15,7 +8,6 @@
 #include <pthread.h>
 #include <stdint.h>
 
-// ---- Minimal IL2CPP declarations (opaque; we never touch internals) ----
 typedef struct Il2CppDomain Il2CppDomain;
 typedef struct Il2CppAssembly Il2CppAssembly;
 typedef struct Il2CppImage Il2CppImage;
@@ -36,6 +28,7 @@ typedef Il2CppClass *(*FNClassFromName)(Il2CppImage *, const char *, const char 
 typedef Il2CppMethod *(*FNClassGetMethod)(Il2CppClass *, const char *, int);
 typedef Il2CppField *(*FNClassGetField)(Il2CppClass *, const char *);
 typedef void (*FNFieldGetValue)(Il2CppObject *, Il2CppField *, void *);
+typedef void (*FNFieldSetValue)(Il2CppObject *, Il2CppField *, void *);
 typedef const Il2CppType *(*FNClassGetType)(Il2CppClass *);
 typedef Il2CppObject *(*FNTypeGetObject)(const Il2CppType *);
 typedef Il2CppObject *(*FNRuntimeInvoke)(Il2CppMethod *, Il2CppObject *, void **, Il2CppObject **);
@@ -54,13 +47,14 @@ typedef struct {
     FNClassGetMethod classGetMethod;
     FNClassGetField classGetField;
     FNFieldGetValue fieldGetValue;
+    FNFieldSetValue fieldSetValue;
     FNClassGetType classGetType;
     FNTypeGetObject typeGetObject;
     FNRuntimeInvoke runtimeInvoke;
     FNObjectUnbox objectUnbox;
     FNObjectNew objectNew;
     FNObjectGetClass objectGetClass;
-    int loaded; // 1 = all required symbols resolved
+    int loaded;
 } Il2CppApi;
 
 static Il2CppApi s_api;
@@ -79,14 +73,13 @@ static void TryLoadApiLocked(void) {
     s_api.classGetMethod = (FNClassGetMethod)dlsym(RTLD_DEFAULT, "il2cpp_class_get_method_from_name");
     s_api.classGetField = (FNClassGetField)dlsym(RTLD_DEFAULT, "il2cpp_class_get_field_from_name");
     s_api.fieldGetValue = (FNFieldGetValue)dlsym(RTLD_DEFAULT, "il2cpp_field_get_value");
+    s_api.fieldSetValue = (FNFieldSetValue)dlsym(RTLD_DEFAULT, "il2cpp_field_set_value");
     s_api.classGetType = (FNClassGetType)dlsym(RTLD_DEFAULT, "il2cpp_class_get_type");
     s_api.typeGetObject = (FNTypeGetObject)dlsym(RTLD_DEFAULT, "il2cpp_type_get_object");
     s_api.runtimeInvoke = (FNRuntimeInvoke)dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
     s_api.objectUnbox = (FNObjectUnbox)dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
     s_api.objectNew = (FNObjectNew)dlsym(RTLD_DEFAULT, "il2cpp_object_new");
     s_api.objectGetClass = (FNObjectGetClass)dlsym(RTLD_DEFAULT, "il2cpp_object_get_class");
-    // object_unbox / object_new / object_get_class / thread_current are optional;
-    // the rest are required.
     s_api.loaded = (s_api.domainGet && s_api.threadAttach && s_api.domainGetAssemblies &&
                     s_api.assemblyGetImage && s_api.imageGetName && s_api.classFromName &&
                     s_api.classGetMethod && s_api.classGetField && s_api.fieldGetValue &&
@@ -108,22 +101,34 @@ static Il2CppApi *Api(void) {
     return &s_api;
 }
 
-const char *FTC_CallResultMessage(FTC_CallResult r) {
+const char *FTC_CallResultMessageLang(FTC_CallResult r, bool english) {
+    if (english) {
+        switch (r) {
+            case FTC_CALL_OK: return "OK";
+            case FTC_CALL_ERR_UNAVAILABLE: return "IL2CPP runtime not ready yet";
+            case FTC_CALL_ERR_NO_INSTANCE: return "Enter gameplay first, then tap again";
+            case FTC_CALL_ERR_NO_METHOD: return "Game method not found";
+            case FTC_CALL_ERR_EXCEPTION: return "Game threw an error";
+            case FTC_CALL_ERR_RETURNED_FALSE: return "Precondition not met in game";
+            default: return "Unknown error";
+        }
+    }
     switch (r) {
         case FTC_CALL_OK: return "OK";
-        case FTC_CALL_ERR_UNAVAILABLE: return "Chua goi duoc: IL2CPP runtime chua san sang";
-        case FTC_CALL_ERR_NO_INSTANCE: return "Chua goi duoc: chua tim thay dev tools trong game (thu vao man choi hoac mo menu tam dung roi bam lai)";
-        case FTC_CALL_ERR_NO_METHOD: return "Chua goi duoc: khong tim thay ham trong game";
-        case FTC_CALL_ERR_EXCEPTION: return "Game bao loi khi chay lenh";
-        case FTC_CALL_ERR_RETURNED_FALSE: return "Game tu choi lenh (chua du dieu kien trong game)";
-        default: return "Loi khong ro";
+        case FTC_CALL_ERR_UNAVAILABLE: return "IL2CPP chưa sẵn sàng";
+        case FTC_CALL_ERR_NO_INSTANCE: return "Hãy vào màn chơi trước rồi bấm lại";
+        case FTC_CALL_ERR_NO_METHOD: return "Không tìm thấy hàm trong game";
+        case FTC_CALL_ERR_EXCEPTION: return "Game báo lỗi khi thực thi";
+        case FTC_CALL_ERR_RETURNED_FALSE: return "Chưa đủ điều kiện trong game";
+        default: return "Lỗi không rõ";
     }
 }
 
+const char *FTC_CallResultMessage(FTC_CallResult r) {
+    return FTC_CallResultMessageLang(r, false);
+}
+
 // ---- Image / class lookup ----
-// il2cpp_image_get_name returns names WITH the ".dll" extension in Unity 6
-// (e.g. "Assembly-CSharp.dll", "UnityEngine.CoreModule.dll", "ForgeTax.Rules.dll").
-// Match both with and without ".dll" so callers never miss on suffix mismatch.
 static bool ImageNameMatches(const char *actual, const char *wanted) {
     if (!actual || !wanted) return false;
     if (strcmp(actual, wanted) == 0) return true;
@@ -166,7 +171,6 @@ static Il2CppClass *FindClass(const char *imageName, const char *ns, const char 
             if (klass) return klass;
         }
     }
-    // Fallback: scan all loaded assemblies (handles split asmdefs like ForgeTax.Rules.dll).
     Il2CppDomain *domain = api->domainGet();
     if (!domain) return NULL;
     size_t count = 0;
@@ -190,16 +194,9 @@ static Il2CppObject *ReadObjectField(Il2CppObject *obj, Il2CppClass *klass, cons
     return value;
 }
 
-// ---- Instance resolution ----
-// Primary: ForgePauseMenu (MonoBehaviour) -> developerPage -> tools.
-// Fallback: ForgeRoom (MonoBehaviour) -> new ForgeDeveloperTools(room).
-//
-// NO CACHING (AEGIS fix): ResolveTools()/ResolveCampaign() re-resolve FRESH
-// on every call and never store an Il2CppObject* across calls, so a scene
-// reload or run reset can never leave a dangling pointer.
+// ---- Instance resolution (fresh every call — never caches stale pointers) ----
 static Il2CppObject *FindUnityObject(Il2CppClass *klass) {
     if (!klass) return NULL;
-    // UnityEngine.Object.FindObjectOfType(Type type, bool includeInactive)
     Il2CppApi *api = Api();
     if (!api->loaded) return NULL;
     Il2CppClass *objectClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
@@ -210,10 +207,6 @@ static Il2CppObject *FindUnityObject(Il2CppClass *klass) {
     if (!rawType) return NULL;
     Il2CppObject *typeObj = api->typeGetObject(rawType);
     if (!typeObj) return NULL;
-    // includeInactive = true so inactive menus/components are still found.
-    // IMPORTANT: in IL2CPP runtime_invoke, reference-type args (System.Type)
-    // are passed directly as the Il2CppObject* pointer, while value-type args
-    // (bool) are passed by address (&includeInactive).
     uint8_t includeInactive = 1;
     void *args[2] = { typeObj, &includeInactive };
     Il2CppObject *exc = NULL;
@@ -227,11 +220,16 @@ static Il2CppObject *FindUnityObject(Il2CppClass *klass) {
     return found;
 }
 
+static Il2CppObject *ResolveRoom(void) {
+    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+    if (!roomClass) return NULL;
+    return FindUnityObject(roomClass);
+}
+
 static Il2CppObject *ResolveTools(void) {
     Il2CppApi *api = Api();
     if (!api->loaded) return NULL;
 
-    // Path 1: pause menu chain.
     Il2CppClass *pauseClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Menu", "ForgePauseMenu");
     Il2CppClass *pageClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperPage");
     if (pauseClass && pageClass) {
@@ -244,18 +242,14 @@ static Il2CppObject *ResolveTools(void) {
             }
         }
     }
-    // Path 2: build a tools instance from the live ForgeRoom.
-    // (ForgeDeveloperTools..ctor(ForgeRoom) — dump.cs RVA 0x263C4E8.)
     Il2CppClass *toolsClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperTools");
-    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
-    if (toolsClass && roomClass && api->objectNew) {
-        Il2CppObject *room = FindUnityObject(roomClass);
+    if (toolsClass && api->objectNew) {
+        Il2CppObject *room = ResolveRoom();
         if (room) {
             Il2CppMethod *ctor = api->classGetMethod(toolsClass, ".ctor", 1);
             if (ctor) {
                 Il2CppObject *tools = api->objectNew(toolsClass);
                 if (tools) {
-                    // Reference-type param: pass `room` directly (NOT &room).
                     void *args[1] = { room };
                     Il2CppObject *exc = NULL;
                     @try { api->runtimeInvoke(ctor, tools, args, &exc); } @catch (...) { exc = (Il2CppObject *)1; }
@@ -268,7 +262,6 @@ static Il2CppObject *ResolveTools(void) {
 }
 
 static Il2CppObject *ResolveCampaign(void) {
-    // Fresh resolve every call (see NO CACHING note above).
     Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
     if (roomClass) {
         Il2CppObject *room = FindUnityObject(roomClass);
@@ -294,10 +287,6 @@ bool FTC_ToolsAvailable(void) {
     return ResolveTools() != NULL;
 }
 
-// ---- Generic invoke ----
-// Calls a bool (or void) method on `obj` (or a static method when obj == NULL).
-// Returns OK only when: no exception AND (no return value OR boxed bool true
-// OR unbox unavailable, in which case no-exception counts as success).
 static FTC_CallResult InvokeBool(Il2CppClass *klass, Il2CppObject *obj,
                                  const char *methodName, int argc, void **args) {
     Il2CppApi *api = Api();
@@ -310,13 +299,21 @@ static FTC_CallResult InvokeBool(Il2CppClass *klass, Il2CppObject *obj,
     Il2CppObject *ret = NULL;
     @try { ret = api->runtimeInvoke(method, obj, args, &exc); } @catch (...) { return FTC_CALL_ERR_EXCEPTION; }
     if (exc) return FTC_CALL_ERR_EXCEPTION;
-    if (!ret) return FTC_CALL_OK; // void method
+    if (!ret) return FTC_CALL_OK;
     if (api->objectUnbox) {
         uint8_t *boxed = NULL;
         @try { boxed = (uint8_t *)api->objectUnbox(ret); } @catch (...) { return FTC_CALL_OK; }
         if (boxed && (*boxed == 0)) return FTC_CALL_ERR_RETURNED_FALSE;
     }
     return FTC_CALL_OK;
+}
+
+static void RefreshRoomDisplaysBestEffort(void) {
+    Il2CppObject *room = ResolveRoom();
+    if (!room) return;
+    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+    if (!roomClass) return;
+    InvokeBool(roomClass, room, "RefreshDisplays", 0, NULL);
 }
 
 static Il2CppClass *ToolsClass(void) {
@@ -344,7 +341,85 @@ static FTC_CallResult InvokeToolsInt(const char *methodName, int value) {
     return InvokeBool(ToolsClass(), tools, methodName, 1, args);
 }
 
-// ---- Public calls (one per feature) ----
+// ---- #4: 2-Mode Forge Always Win (100% IL2CPP — NO JIT needed!) ----
+// mode = 0 (OFF / Normal), 1 (Success 100%), 2 (Great 100% / purple).
+// Uses DeveloperOverrides.set_ForgeMode + ForgeCampaign.altarForced (5 = GreatSuccess
+// in NewRelicRules.ApplyAltar, affecting BOTH TicketDeck.FillTicketDeck display
+// outside AND TicketDeck.Chances strike roll!) + ForgeRoom.RefreshDisplays().
+static bool WriteCampaignAltarForced(int32_t forcedValue, bool onlyIfChanged) {
+    Il2CppApi *api = Api();
+    if (!api->loaded || !api->fieldSetValue) return false;
+    Il2CppObject *campaign = ResolveCampaign();
+    if (!campaign) return false;
+    Il2CppClass *campClass = (api->objectGetClass)
+        ? api->objectGetClass(campaign)
+        : FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+    if (!campClass) campClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+    if (!campClass) return false;
+    Il2CppField *field = api->classGetField(campClass, "altarForced");
+    if (!field) return false;
+    if (onlyIfChanged) {
+        int32_t cur = 0;
+        api->fieldGetValue(campaign, field, &cur);
+        if (cur == forcedValue) return false;
+    }
+    api->fieldSetValue(campaign, field, &forcedValue);
+    return true;
+}
+
+FTC_CallResult FTC_SetForgeWinMode(int mode) {
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppClass *ovClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "DeveloperOverrides");
+    if (!ovClass) return FTC_CALL_ERR_NO_METHOD;
+
+    // DeveloperForgeMode: Normal=0, NoBreak=1, AlwaysSuccess=2.
+    int32_t forgeMode = (mode == 0) ? 0 : 2;
+    void *args[1] = { &forgeMode };
+    FTC_CallResult cr = InvokeBool(ovClass, NULL, "set_ForgeMode", 1, args);
+    if (cr != FTC_CALL_OK) return cr;
+
+    if (mode == 2) {
+        // Great Success 100%: altarForced = 5 -> tickets = [0,0,0,0,1.0]
+        if (!WriteCampaignAltarForced(5, false)) {
+            // Even if campaign isn't loaded yet, AlwaysSuccess is already set;
+            // keep-alive timer will apply altarForced=5 as soon as campaign loads.
+            RefreshRoomDisplaysBestEffort();
+            return FTC_CALL_OK;
+        }
+    } else {
+        WriteCampaignAltarForced(0, false);
+    }
+    RefreshRoomDisplaysBestEffort();
+    return FTC_CALL_OK;
+}
+
+void FTC_KeepGreatForgeAlive(void) {
+    @try {
+        if (WriteCampaignAltarForced(5, true)) {
+            RefreshRoomDisplaysBestEffort();
+        }
+    } @catch (...) {}
+}
+
+FTC_CallResult FTC_SetDragonGodMode(bool enabled) {
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppClass *ovClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "DeveloperOverrides");
+    if (!ovClass) return FTC_CALL_ERR_NO_METHOD;
+    uint8_t val = enabled ? 1 : 0;
+    void *args[1] = { &val };
+    FTC_CallResult cr = InvokeBool(ovClass, NULL, "set_DragonGodMode", 1, args);
+    if (cr != FTC_CALL_OK) return cr;
+    Il2CppObject *room = ResolveRoom();
+    if (room) {
+        Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+        if (roomClass) InvokeBool(roomClass, room, "ApplyDeveloperGodMode", 0, NULL);
+    }
+    return FTC_CALL_OK;
+}
+
+// ---- Public calls ----
 FTC_CallResult FTC_AddGold(double amount) { return InvokeToolsDouble("AddGold", amount); }
 FTC_CallResult FTC_GiveAllRelics(void) { return InvokeTools0("GiveAllRelics"); }
 FTC_CallResult FTC_CycleForgeMode(void) { return InvokeTools0("CycleForgeMode"); }
@@ -369,16 +444,8 @@ FTC_CallResult FTC_ToggleMerchantShelfSlot(void) { return InvokeTools0("ToggleMe
 FTC_CallResult FTC_ToggleFps(void) { return InvokeTools0("ToggleFps"); }
 
 FTC_CallResult FTC_SetAntiLag(bool enabled) {
-    // Extreme Max-FPS / Anti-Lag boost via pure static IL2CPP calls (no __TEXT
-    // patch, works natively on TrollStore without JIT):
-    //   - Application.set_targetFrameRate(120) -> unlocks 120 FPS on ProMotion
-    //     and prevents Unity from throttling down to 30 FPS on 60 Hz iPhone 7 Plus.
-    //   - QualitySettings: vSyncCount=0, antiAliasing=0 (MSAA off),
-    //     globalTextureMipmapLimit=1 (cuts 3D texture bandwidth ~75%),
-    //     enableLODCrossFade=false.
-    //   - ScalableBufferManager.ResizeBuffers(0.8, 0.8) -> lighter GPU fillrate.
-    //   - ForgeQualityTier.Force(Low) -> lowers game's own FX/shader tier
-    //     (restored to Auto/null when disabled).
+    // Instant, zero-stall, 100% crash-free Unity performance tuning (no mid-frame
+    // Metal buffer resize or synchronous VRAM mipmap reload).
     Il2CppApi *api = Api();
     if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
 
@@ -403,19 +470,6 @@ FTC_CallResult FTC_SetAntiLag(bool enabled) {
         if (InvokeBool(qsClass, NULL, "set_antiAliasing", 1, aaArgs) == FTC_CALL_OK) {
             anyOk = true;
         }
-        int32_t mip = enabled ? 1 : 0;
-        void *mipArgs[1] = { &mip };
-        InvokeBool(qsClass, NULL, "set_globalTextureMipmapLimit", 1, mipArgs);
-
-        uint8_t lodFade = enabled ? 0 : 1;
-        void *lodArgs[1] = { &lodFade };
-        InvokeBool(qsClass, NULL, "set_enableLODCrossFade", 1, lodArgs);
-    }
-    Il2CppClass *sbmClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "ScalableBufferManager");
-    if (sbmClass) {
-        float scale = enabled ? 0.80f : 1.0f;
-        void *sArgs[2] = { &scale, &scale };
-        InvokeBool(sbmClass, NULL, "ResizeBuffers", 2, sArgs);
     }
     Il2CppClass *qtClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Quality", "ForgeQualityTier");
     if (qtClass) {
@@ -436,8 +490,6 @@ FTC_CallResult FTC_SetAntiLag(bool enabled) {
 }
 
 FTC_CallResult FTC_SetTimeScale(float scale) {
-    // Pure static UnityEngine.Time.set_timeScale(float) — works natively on
-    // TrollStore without JIT. Clamped to [0.5, 4.0] for stability.
     if (scale < 0.5f) scale = 0.5f;
     if (scale > 4.0f) scale = 4.0f;
     Il2CppApi *api = Api();
@@ -449,10 +501,6 @@ FTC_CallResult FTC_SetTimeScale(float scale) {
 }
 
 FTC_CallResult FTC_SetQualityTier(int tier) {
-    // SetQualityTier(Nullable<QualityTier>) — QualityTier: Low=0, Mid=1, High=2.
-    // Verified from global-metadata.dat (mscorlib.dll System.Nullable`1) AND
-    // ARM64 disassembly at 0x24ef138 (tbz w19,#0) / 0x2edd5d4 (ldrb w8,[x0,#0]):
-    // field 0 = hasValue (bool at +0), field 1 = value (int32 at +4).
     if (tier < 0) tier = 0;
     if (tier > 2) tier = 2;
     struct {
@@ -469,15 +517,12 @@ FTC_CallResult FTC_SetQualityTier(int tier) {
         FTC_CallResult cr = InvokeBool(ToolsClass(), tools, "SetQualityTier", 1, args);
         if (cr == FTC_CALL_OK) return cr;
     }
-    // Static fallback so #32 works on any screen (even before ForgeRoom loads).
     Il2CppClass *qtClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Quality", "ForgeQualityTier");
     if (!qtClass) return tools ? FTC_CALL_ERR_NO_METHOD : FTC_CALL_ERR_NO_INSTANCE;
     return InvokeBool(qtClass, NULL, "Force", 1, args);
 }
 
 FTC_CallResult FTC_AddRunTickets(int outcome, int count) {
-    // ForgeCampaign.AddRunTickets(int outcome, int count) in ForgeTax.Rules.dll.
-    // ForgeOutcome: Destruction=0, Damage=1, Hold=2, Success=3, GreatSuccess=4.
     Il2CppObject *campaign = ResolveCampaign();
     if (!campaign) return FTC_CALL_ERR_NO_INSTANCE;
     Il2CppApi *api = Api();
