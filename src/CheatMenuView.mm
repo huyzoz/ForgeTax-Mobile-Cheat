@@ -1,36 +1,49 @@
-// CheatMenuView.mm — see header. Colours are the mockup's CSS tokens.
-// Flame path is copied verbatim from the mockup's logo SVG
-// (viewBox 0 0 24 24):
-//   M12 2c.9 2.8-2.1 4.3-2.1 6.9 0 1.4.9 2.4 2.1 2.4s2.1-1 2.1-2.4
-//   c1.9 1.4 2.9 3.3 2.9 5.2A5 5 0 0 1 7 14.1C7 10 10 5.9 12 2z
-// Font is the system font (San Francisco) — no bundled fonts.
+// CheatMenuView.mm — 16:9 Landscape Zero-Lag Cheat UI + Cutout Demon Logo.
+//
+// Design & Performance Guarantees:
+//   - Transparent cutout demon mask logo (LogoImageData.h): NO backdrop circle,
+//     NO extra dimming layer behind the panel, NO offscreen shadow blur.
+//   - Panel ALWAYS leaves a clear gap around the logo so it never overlaps it.
+//   - Two explicit header controls: "-" (minimize back to logo) and expand
+//     (toggle compact 16:9 window <-> full-screen rounded card).
+//   - Pure manual CGRect frame layout (ZERO UIStackView / Auto Layout solver
+//     inside the scroll area) + 100% solid opaque surfaces (ZERO alpha overdraw,
+//     ZERO shadowRadius blur) -> locked 60/120 FPS scrolling & instant taps.
+//   - In-place state updates on every tap (NO view tear-down / rebuild).
+//   - Fixed bottom-left FPS counter (detached from logo, change-only redraws).
+//   - Persistent NSUserDefaults config with staggered, non-blocking restore
+//     so enabling many cheats never causes startup lag or stutter.
 #import "CheatMenuView.h"
 #import "FeatureCatalog.h"
 #import "PatchEngine.h"
 #import "GameBridge.h"
+#import "LogoImageData.h"
 
 #import <QuartzCore/QuartzCore.h>
 #include <math.h>
 #include <string.h>
 
-// ---- Mockup design tokens ----
-#define FTC_C_BG      0x171009
-#define FTC_C_SURFACE 0x241A10
-#define FTC_C_SURF2   0x2C2013
-#define FTC_C_SURF3   0x3A2A1A
-#define FTC_C_BORDER  0x4A341C
-#define FTC_C_BORDER2 0x5A4020
-#define FTC_C_TEXT    0xF3E9D2
-#define FTC_C_TEXT2   0xCBB894
-#define FTC_C_TEXT3   0xA89880
-#define FTC_C_GOLD    0xF7D774
-#define FTC_C_GOLD2   0xF2B63D
-#define FTC_C_GOLD3   0xFFB347
-#define FTC_C_ACCENT  0xFF7A1A
-#define FTC_C_ACCENT2 0xE85D04
-#define FTC_C_ACCENT3 0xFF8A1E
-#define FTC_C_ONACC   0x1A1208
-#define FTC_C_FPS     0x7DFF8A
+// ---- Crimson / Obsidian / Gold Palette (100% opaque solids for 0 GPU blend overhead) ----
+#define FTC_C_PANEL      0x120D0E
+#define FTC_C_HEADER     0x1A1113
+#define FTC_C_SIDEBAR    0x160F11
+#define FTC_C_TAB_ON     0x2C1519
+#define FTC_C_CARD       0x1C1416
+#define FTC_C_CARD_ON    0x2D1519
+#define FTC_C_BTN_BG     0x2A1B1E
+#define FTC_C_BORDER     0x352024
+#define FTC_C_BORDER_HI  0x59252C
+#define FTC_C_CRIMSON    0xE52432
+#define FTC_C_CRIMSON_HI 0xFF3B49
+#define FTC_C_GOLD       0xF7D774
+#define FTC_C_GOLD2      0xE8B949
+#define FTC_C_TEXT       0xF5ECEE
+#define FTC_C_TEXT2      0xB8A3A7
+#define FTC_C_OK         0x6BE684
+#define FTC_C_ERR        0xFF8A65
+#define FTC_C_ONACC      0x140A0B
+#define FTC_C_FPS_BG     0x120C0D
+#define FTC_C_FPS_TXT    0x7DFF8A
 
 static UIColor *FTC_Color(uint32_t hex) {
     return [UIColor colorWithRed:((hex >> 16) & 0xFF) / 255.0
@@ -38,47 +51,94 @@ static UIColor *FTC_Color(uint32_t hex) {
                             blue:(hex & 0xFF) / 255.0 alpha:1.0];
 }
 
-static const CGFloat kLogoSize = 56.0;
-static const CGFloat kPanelWidth = 360.0;
-static const CGFloat kPanelMaxHeight = 560.0;
-static const CGFloat kMargin = 8.0;
+static const CGFloat kLogoSize    = 54.0;
+static const CGFloat kLogoGap     = 10.0;
+static const CGFloat kMargin      = 8.0;
+static const CGFloat kHeaderH     = 38.0;
+static const CGFloat kSidebarW    = 104.0;
+static const CGFloat kCompactMaxW = 540.0;
+static const CGFloat kCompactMaxH = 324.0;
 
-typedef struct { const char *cid; const char *name; } FTCCategory;
-static const FTCCategory kCategories[] = {
-    {"forge", "Ren"}, {"res", "Tai nguyen"}, {"relic", "Di vat"},
-    {"shop", "Thuong nhan"}, {"dragon", "Rong"}, {"day", "Ngay & Choi"},
-    {"ads", "Quang cao"},
+// NSUserDefaults persistence keys
+static NSString * const kPrefSwitches  = @"FTC_v2_switches";
+static NSString * const kPrefQuality   = @"FTC_v2_quality";
+static NSString * const kPrefSpeed     = @"FTC_v2_speed";
+static NSString * const kPrefLogoX     = @"FTC_v2_logoX";
+static NSString * const kPrefLogoY     = @"FTC_v2_logoY";
+static NSString * const kPrefMaximized = @"FTC_v2_maximized";
+static NSString * const kPrefTab       = @"FTC_v2_tab";
+
+typedef struct { const char *cid; const char *name; } FTCTab;
+static const FTCTab kTabs[] = {
+    {"forge",   "Ren"},
+    {"res",     "Tai nguyen"},
+    {"relic",   "Di vat"},
+    {"shop",    "Thuong nhan"},
+    {"dragon",  "Rong"},
+    {"day",     "Ngay & Choi"},
+    {"ads",     "Quang cao"},
+    {"setting", "Cai dat"},
 };
-static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]);
+static const NSInteger kTabCount = (NSInteger)(sizeof(kTabs) / sizeof(kTabs[0]));
+
+static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 
 @interface CheatMenuView ()
+// Floating logo (transparent demon mask cutout) + fixed bottom-left FPS badge
 @property (nonatomic, strong) UIButton *logoButton;
 @property (nonatomic, strong) UILabel *fpsBadge;
+
+// Main 16:9 panel + chrome
 @property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UIView *headerBar;
+@property (nonatomic, strong) UIView *headerAccent;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *activeCountBadge;
+@property (nonatomic, strong) UIButton *minimizeButton;
+@property (nonatomic, strong) UIButton *expandButton;
+@property (nonatomic, strong) UIView *sidebar;
+@property (nonatomic, strong) UIView *sidebarDivider;
+@property (nonatomic, strong) NSMutableArray<UIButton *> *tabButtons;
+@property (nonatomic, strong) NSMutableArray<UIView *> *tabIndicators;
 @property (nonatomic, strong) UIScrollView *scrollView;
-@property (nonatomic, strong) UIStackView *stackView;
-@property (nonatomic, strong) UILabel *dayPillValue;
+@property (nonatomic, strong) UIButton *resetAllButton;
+
+// Active tab's in-place card view references (for 0-lag state updates)
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, UIView *> *cardMap;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, UILabel *> *subLabelMap;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, UISwitch *> *switchMap;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, UILabel *> *stepValMap;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, UISegmentedControl *> *segMap;
+
+// Window / layout state
 @property (nonatomic, assign) BOOL menuOpen;
-@property (nonatomic, assign) BOOL contentBuilt;
+@property (nonatomic, assign) BOOL maximized;
+@property (nonatomic, assign) NSInteger selectedTab;
 @property (nonatomic, assign) BOOL logoPositioned;
 @property (nonatomic, assign) CGPoint dragStart;
 @property (nonatomic, assign) CGPoint dragOrigin;
 @property (nonatomic, assign) BOOL dragMoved;
+@property (nonatomic, assign) CGSize lastLayoutSize;
+@property (nonatomic, assign) CGFloat lastScrollWidth;
+
+// FPS display link (only active while #40 is ON)
 @property (nonatomic, strong) CADisplayLink *fpsLink;
 @property (nonatomic, assign) NSInteger fpsFrames;
-@property (nonatomic, assign) NSTimeInterval fpsLastUpdate;
-// Per-feature UI state. All features default OFF at launch.
+@property (nonatomic, assign) CFTimeInterval fpsLastUpdate;
+@property (nonatomic, assign) NSInteger lastDisplayedFps;
+
+// Feature state
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *switchOn;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *stepValue;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *modeIndex;
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSString *> *statusText;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *catOpen;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *statusKind; // 0=neutral, 1=ok, 2=err
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *descOpen;
-@property (nonatomic, assign) BOOL engineOpen;
-@property (nonatomic, assign) BOOL settingOpen;
-@property (nonatomic, assign) NSInteger currentDay;
-@property (nonatomic, assign) CGSize lastLayoutSize;
-@property (nonatomic, assign) CGFloat contentHeight;
+
+// Staggered startup restore state (runs once, never blocks)
+@property (nonatomic, assign) BOOL restoreScheduled;
+@property (nonatomic, assign) NSInteger pendingDevRestoreTries;
+@property (nonatomic, strong) NSMutableArray<NSNumber *> *pendingDevToggleFids;
 @end
 
 @implementation CheatMenuView
@@ -95,42 +155,47 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
     _stepValue = [NSMutableDictionary dictionary];
     _modeIndex = [NSMutableDictionary dictionary];
     _statusText = [NSMutableDictionary dictionary];
-    _catOpen = [NSMutableDictionary dictionary];
+    _statusKind = [NSMutableDictionary dictionary];
     _descOpen = [NSMutableDictionary dictionary];
-    _engineOpen = YES;    // mockup default: CHEAT ENGINE open
-    _settingOpen = NO;    // mockup default: SETTING closed
-    _currentDay = 12;     // mockup pill default
+    _cardMap = [NSMutableDictionary dictionary];
+    _subLabelMap = [NSMutableDictionary dictionary];
+    _switchMap = [NSMutableDictionary dictionary];
+    _stepValMap = [NSMutableDictionary dictionary];
+    _segMap = [NSMutableDictionary dictionary];
+    _tabButtons = [NSMutableArray array];
+    _tabIndicators = [NSMutableArray array];
+    _pendingDevToggleFids = [NSMutableArray array];
+
     _menuOpen = NO;
-    _contentBuilt = NO;
+    _maximized = NO;
+    _selectedTab = 0;
     _logoPositioned = NO;
-    _contentHeight = 0;
+    _lastDisplayedFps = -1;
+    _restoreScheduled = NO;
 
     for (size_t i = 0; i < kFTC_FeatureCount; i++) {
         const FTC_Feature *f = &kFTC_Features[i];
         if (f->kind == FTC_KIND_STEP) {
-            // Defaults from the mockup: grade 0, day 1, tickets 0.
             _stepValue[@(f->fid)] = (f->fid == 9) ? @(1) : @(0);
         }
         if (f->kind == FTC_KIND_MODE) {
             _modeIndex[@(f->fid)] = @(0);
         }
     }
+
+    [self loadSavedPreferences];
     [self buildLogo];
     [self buildPanel];
     return self;
 }
 
-// Only the logo and the panel take touches; taps elsewhere pass through
-// to the game underneath.
+// Pass-through: ONLY the floating demon logo and (when open) the panel accept touches.
+// No invisible backdrop layer is ever added behind the UI.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    if (!self.menuOpen) {
-        if (CGRectContainsPoint(self.logoButton.frame, point)) {
-            return [super hitTest:point withEvent:event];
-        }
-        return nil;
+    if (CGRectContainsPoint(self.logoButton.frame, point)) {
+        return [super hitTest:point withEvent:event];
     }
-    if (CGRectContainsPoint(self.logoButton.frame, point) ||
-        CGRectContainsPoint(self.panel.frame, point)) {
+    if (_menuOpen && CGRectContainsPoint(self.panel.frame, point)) {
         return [super hitTest:point withEvent:event];
     }
     return nil;
@@ -140,82 +205,55 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 
 - (UIEdgeInsets)ftcSafeInsets {
     UIEdgeInsets s = self.safeAreaInsets;
-    return UIEdgeInsetsMake(MAX(kMargin, s.top + kMargin),
-                            MAX(kMargin, s.left + kMargin),
-                            MAX(kMargin, s.bottom + kMargin),
-                            MAX(kMargin, s.right + kMargin));
+    return UIEdgeInsetsMake(MAX(kMargin, s.top + 6.0),
+                            MAX(kMargin, s.left + 6.0),
+                            MAX(kMargin, s.bottom + 6.0),
+                            MAX(kMargin, s.right + 6.0));
 }
 
-#pragma mark - Logo (flame, mockup SVG path)
+#pragma mark - Cutout Demon Logo + Fixed Bottom-Left FPS Badge
 
 - (void)buildLogo {
     UIButton *logo = [UIButton buttonWithType:UIButtonTypeCustom];
     logo.frame = CGRectMake(0, 0, kLogoSize, kLogoSize);
-    logo.layer.cornerRadius = kLogoSize / 2.0;
-    logo.layer.borderWidth = 2.0;
-    logo.layer.borderColor = FTC_Color(FTC_C_GOLD3).CGColor;
-    logo.layer.masksToBounds = NO;
-    logo.layer.shadowColor = FTC_Color(FTC_C_ACCENT).CGColor;
-    logo.layer.shadowOpacity = 0.45;
-    logo.layer.shadowRadius = 11.0;
-    logo.layer.shadowOffset = CGSizeZero;
+    // Pure transparent cutout — NO circular backdrop, NO added layer behind logo,
+    // NO offscreen shadowRadius blur.
+    logo.backgroundColor = [UIColor clearColor];
+    logo.opaque = NO;
+    logo.clipsToBounds = NO;
+    logo.adjustsImageWhenHighlighted = NO;
     logo.accessibilityLabel = @"Mo / dong menu cheat";
 
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.frame = logo.bounds;
-    grad.cornerRadius = kLogoSize / 2.0;
-    grad.colors = @[(id)FTC_Color(FTC_C_ACCENT3).CGColor, (id)FTC_Color(FTC_C_ACCENT2).CGColor];
-    grad.startPoint = CGPointMake(0.5, 0.0);
-    grad.endPoint = CGPointMake(0.5, 1.0);
-    [logo.layer insertSublayer:grad atIndex:0];
-
-    // Flame, verbatim from the mockup SVG (24x24 viewBox, drawn at 28pt).
-    UIBezierPath *flame = [UIBezierPath bezierPath];
-    CGFloat s = 28.0 / 24.0;
-    [flame moveToPoint:CGPointMake(12 * s, 2 * s)];
-    [flame addCurveToPoint:CGPointMake(9.9 * s, 8.9 * s)
-             controlPoint1:CGPointMake(12.9 * s, 4.8 * s)
-             controlPoint2:CGPointMake(9.9 * s, 6.3 * s)];
-    [flame addCurveToPoint:CGPointMake(12 * s, 11.3 * s)
-             controlPoint1:CGPointMake(9.9 * s, 10.3 * s)
-             controlPoint2:CGPointMake(10.8 * s, 11.3 * s)];
-    [flame addCurveToPoint:CGPointMake(14.1 * s, 8.9 * s)
-             controlPoint1:CGPointMake(13.2 * s, 11.3 * s)
-             controlPoint2:CGPointMake(14.1 * s, 10.3 * s)];
-    [flame addCurveToPoint:CGPointMake(17 * s, 14.1 * s)
-             controlPoint1:CGPointMake(16 * s, 10.3 * s)
-             controlPoint2:CGPointMake(17 * s, 12.2 * s)];
-    [flame addArcWithCenter:CGPointMake(12 * s, 14.1 * s) radius:5 * s
-                 startAngle:0 endAngle:M_PI clockwise:YES];
-    [flame addCurveToPoint:CGPointMake(12 * s, 2 * s)
-             controlPoint1:CGPointMake(7 * s, 12 * s)
-             controlPoint2:CGPointMake(10 * s, 5.9 * s)];
-    [flame closePath];
-    CAShapeLayer *flameLayer = [CAShapeLayer layer];
-    flameLayer.path = flame.CGPath;
-    flameLayer.fillColor = FTC_Color(FTC_C_ONACC).CGColor;
-    flameLayer.frame = CGRectMake((kLogoSize - 28) / 2.0, (kLogoSize - 28) / 2.0, 28, 28);
-    [logo.layer addSublayer:flameLayer];
+    NSData *pngData = [NSData dataWithBytesNoCopy:(void *)kFTC_LogoPngData
+                                           length:kFTC_LogoPngSize
+                                     freeWhenDone:NO];
+    UIImage *img = [UIImage imageWithData:pngData scale:3.0];
+    if (img) {
+        [logo setImage:img forState:UIControlStateNormal];
+        logo.imageView.contentMode = UIViewContentModeScaleAspectFit;
+    }
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(onLogoTap:)];
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
         initWithTarget:self action:@selector(onLogoPan:)];
-    // Pan starts immediately on drag; tap fires cleanly on stationary press.
     [tap requireGestureRecognizerToFail:pan];
     [logo addGestureRecognizer:pan];
     [logo addGestureRecognizer:tap];
     [self addSubview:logo];
     self.logoButton = logo;
 
+    // Fixed bottom-left FPS counter (detached from logo, solid opaque, 0 shadow).
     UILabel *fps = [[UILabel alloc] initWithFrame:CGRectZero];
     fps.text = @"-- FPS";
-    fps.font = [UIFont boldSystemFontOfSize:12];
-    fps.textColor = FTC_Color(FTC_C_FPS);
-    fps.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.72];
-    fps.layer.borderColor = [FTC_Color(FTC_C_GOLD2) colorWithAlphaComponent:0.4].CGColor;
+    fps.font = [UIFont monospacedDigitSystemFontOfSize:11.5 weight:UIFontWeightBold];
+    fps.textColor = FTC_Color(FTC_C_FPS_TXT);
+    fps.backgroundColor = FTC_Color(FTC_C_FPS_BG);
+    fps.opaque = YES;
+    fps.userInteractionEnabled = NO;
+    fps.layer.borderColor = FTC_Color(FTC_C_BORDER_HI).CGColor;
     fps.layer.borderWidth = 1.0;
-    fps.layer.cornerRadius = 8.0;
+    fps.layer.cornerRadius = 6.0;
     fps.layer.masksToBounds = YES;
     fps.textAlignment = NSTextAlignmentCenter;
     fps.hidden = YES;
@@ -228,7 +266,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         if (tap.state == UIGestureRecognizerStateEnded) {
             [self setMenuOpen:!_menuOpen];
         }
-    } @catch (...) { /* toggle must never crash the game */ }
+    } @catch (...) {}
 }
 
 - (void)onLogoPan:(UIPanGestureRecognizer *)pan {
@@ -241,7 +279,7 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         } else if (pan.state == UIGestureRecognizerStateChanged) {
             CGFloat dx = loc.x - self.dragStart.x;
             CGFloat dy = loc.y - self.dragStart.y;
-            if (fabs(dx) + fabs(dy) > 6.0) self.dragMoved = YES;
+            if (fabs(dx) + fabs(dy) > 5.0) self.dragMoved = YES;
             if (self.dragMoved) {
                 UIEdgeInsets safe = [self ftcSafeInsets];
                 CGFloat maxX = MAX(safe.left, self.bounds.size.width - kLogoSize - safe.right);
@@ -250,82 +288,150 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
                 origin.x = MAX(safe.left, MIN(origin.x, maxX));
                 origin.y = MAX(safe.top, MIN(origin.y, maxY));
                 self.logoButton.frame = CGRectMake(origin.x, origin.y, kLogoSize, kLogoSize);
-                [self layoutPanel];
+                // Keep panel clear of logo while dragging if panel is open.
+                if (_menuOpen) [self layoutPanel];
             }
         } else if (pan.state == UIGestureRecognizerStateEnded ||
                    pan.state == UIGestureRecognizerStateCancelled) {
-            [self layoutPanel];
+            if (_menuOpen) [self layoutPanel];
+            [self saveLogoPosition];
         }
-    } @catch (...) { /* drag must never crash the game */ }
+    } @catch (...) {}
 }
 
-#pragma mark - Panel
+#pragma mark - 16:9 Landscape Panel Chrome
 
 - (void)buildPanel {
+    // 100% opaque panel with crisp border and ZERO shadowRadius offscreen blur.
     UIView *panel = [[UIView alloc] initWithFrame:CGRectZero];
-    panel.backgroundColor = FTC_Color(FTC_C_SURFACE);
-    panel.layer.cornerRadius = 18.0;
-    panel.layer.borderColor = FTC_Color(FTC_C_BORDER).CGColor;
-    panel.layer.borderWidth = 1.0;
-    panel.layer.shadowColor = [UIColor blackColor].CGColor;
-    panel.layer.shadowOpacity = 0.7;
-    panel.layer.shadowRadius = 24.0;
-    panel.layer.shadowOffset = CGSizeMake(0, 8);
+    panel.backgroundColor = FTC_Color(FTC_C_PANEL);
+    panel.opaque = YES;
+    panel.layer.cornerRadius = 16.0;
+    panel.layer.borderColor = FTC_Color(FTC_C_BORDER_HI).CGColor;
+    panel.layer.borderWidth = 1.5;
+    panel.layer.masksToBounds = YES;
     panel.hidden = YES;
     [self addSubview:panel];
     self.panel = panel;
 
-    // Header: FORGE TAXX + 3 pills (mockup hero).
+    // Header bar
+    UIView *header = [[UIView alloc] initWithFrame:CGRectZero];
+    header.backgroundColor = FTC_Color(FTC_C_HEADER);
+    header.opaque = YES;
+    [panel addSubview:header];
+    self.headerBar = header;
+
+    UIView *accent = [[UIView alloc] initWithFrame:CGRectZero];
+    accent.backgroundColor = FTC_Color(FTC_C_CRIMSON);
+    accent.opaque = YES;
+    [header addSubview:accent];
+    self.headerAccent = accent;
+
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectZero];
     title.text = @"FORGE TAXX";
-    title.font = [UIFont boldSystemFontOfSize:24];
+    title.font = [UIFont boldSystemFontOfSize:15];
     title.textColor = FTC_Color(FTC_C_GOLD);
-    title.textAlignment = NSTextAlignmentCenter;
-    title.tag = 1001;
-    [panel addSubview:title];
+    title.backgroundColor = FTC_Color(FTC_C_HEADER);
+    title.opaque = YES;
+    [header addSubview:title];
+    self.titleLabel = title;
 
-    NSArray *pills = @[@{@"v": @"9.999E+99", @"l": @"Vang"},
-                       @{@"v": @"Grade 999", @"l": @"Gioi han kiem"},
-                       @{@"v": @"Ngay 12", @"l": @"Trong 24 ngay"}];
-    for (NSInteger i = 0; i < 3; i++) {
-        UIView *pill = [[UIView alloc] initWithFrame:CGRectZero];
-        pill.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.38];
-        pill.layer.borderColor = [FTC_Color(FTC_C_GOLD2) colorWithAlphaComponent:0.4].CGColor;
-        pill.layer.borderWidth = 1.0;
-        pill.layer.cornerRadius = 12.0;
-        pill.tag = 2000 + i;
-        UILabel *v = [[UILabel alloc] initWithFrame:CGRectZero];
-        v.text = pills[i][@"v"];
-        v.font = [UIFont boldSystemFontOfSize:13];
-        v.textColor = FTC_Color(FTC_C_GOLD);
-        v.textAlignment = NSTextAlignmentCenter;
-        v.tag = 2100 + i;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectZero];
-        l.text = pills[i][@"l"];
-        l.font = [UIFont systemFontOfSize:11];
-        l.textColor = FTC_Color(FTC_C_TEXT2);
-        l.textAlignment = NSTextAlignmentCenter;
-        l.tag = 2200 + i;
-        [pill addSubview:v];
-        [pill addSubview:l];
-        [panel addSubview:pill];
-        if (i == 2) self.dayPillValue = v;
+    UILabel *badge = [[UILabel alloc] initWithFrame:CGRectZero];
+    badge.text = @"0 BAT";
+    badge.font = [UIFont boldSystemFontOfSize:10.5];
+    badge.textColor = FTC_Color(FTC_C_CRIMSON_HI);
+    badge.backgroundColor = FTC_Color(FTC_C_TAB_ON);
+    badge.opaque = YES;
+    badge.textAlignment = NSTextAlignmentCenter;
+    badge.layer.cornerRadius = 8.0;
+    badge.layer.masksToBounds = YES;
+    [header addSubview:badge];
+    self.activeCountBadge = badge;
+
+    // Minimize button ("-") -> collapses cleanly back to the floating logo
+    UIButton *minBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [minBtn setTitle:@"−" forState:UIControlStateNormal];
+    minBtn.titleLabel.font = [UIFont boldSystemFontOfSize:18];
+    [minBtn setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+    minBtn.backgroundColor = FTC_Color(FTC_C_BTN_BG);
+    minBtn.opaque = YES;
+    minBtn.layer.cornerRadius = 7.0;
+    minBtn.layer.borderColor = FTC_Color(FTC_C_BORDER_HI).CGColor;
+    minBtn.layer.borderWidth = 1.0;
+    minBtn.accessibilityLabel = @"Thu gon menu";
+    [minBtn addTarget:self action:@selector(onMinimizeTap) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:minBtn];
+    self.minimizeButton = minBtn;
+
+    // Expand / Restore button -> toggles compact 16:9 <-> rounded full-screen
+    UIButton *expBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    [expBtn setTitle:@"⤢" forState:UIControlStateNormal];
+    expBtn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    [expBtn setTitleColor:FTC_Color(FTC_C_GOLD) forState:UIControlStateNormal];
+    expBtn.backgroundColor = FTC_Color(FTC_C_BTN_BG);
+    expBtn.opaque = YES;
+    expBtn.layer.cornerRadius = 7.0;
+    expBtn.layer.borderColor = FTC_Color(FTC_C_BORDER_HI).CGColor;
+    expBtn.layer.borderWidth = 1.0;
+    expBtn.accessibilityLabel = @"Phong to / thu vua";
+    [expBtn addTarget:self action:@selector(onExpandTap) forControlEvents:UIControlEventTouchUpInside];
+    [header addSubview:expBtn];
+    self.expandButton = expBtn;
+
+    // Left Tab Sidebar (8 compact tabs -> zero sidebar scrolling on 16:9)
+    UIView *sidebar = [[UIView alloc] initWithFrame:CGRectZero];
+    sidebar.backgroundColor = FTC_Color(FTC_C_SIDEBAR);
+    sidebar.opaque = YES;
+    [panel addSubview:sidebar];
+    self.sidebar = sidebar;
+
+    UIView *divider = [[UIView alloc] initWithFrame:CGRectZero];
+    divider.backgroundColor = FTC_Color(FTC_C_BORDER);
+    divider.opaque = YES;
+    [panel addSubview:divider];
+    self.sidebarDivider = divider;
+
+    for (NSInteger i = 0; i < kTabCount; i++) {
+        UIButton *tb = [UIButton buttonWithType:UIButtonTypeCustom];
+        tb.tag = i;
+        tb.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+        tb.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+        tb.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        tb.opaque = YES;
+        tb.layer.cornerRadius = 8.0;
+        tb.layer.masksToBounds = YES;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        tb.contentEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 6);
+#pragma clang diagnostic pop
+        [tb addTarget:self action:@selector(onSelectTab:) forControlEvents:UIControlEventTouchUpInside];
+
+        UIView *ind = [[UIView alloc] initWithFrame:CGRectMake(0, 5, 3, 20)];
+        ind.backgroundColor = FTC_Color(FTC_C_CRIMSON_HI);
+        ind.opaque = YES;
+        ind.hidden = YES;
+        [tb addSubview:ind];
+
+        [sidebar addSubview:tb];
+        [self.tabButtons addObject:tb];
+        [self.tabIndicators addObject:ind];
     }
 
+    // Right ScrollView (pure manual-frame opaque cards, 0 Auto Layout overhead)
     UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    scroll.backgroundColor = FTC_Color(FTC_C_PANEL);
+    scroll.opaque = YES;
     scroll.showsVerticalScrollIndicator = YES;
-    scroll.alwaysBounceVertical = YES;
+    scroll.alwaysBounceVertical = NO;
+    scroll.delaysContentTouches = NO;
     [panel addSubview:scroll];
     self.scrollView = scroll;
 
-    UIStackView *stack = [[UIStackView alloc] initWithFrame:CGRectZero];
-    stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 10;
-    stack.alignment = UIStackViewAlignmentFill;
-    stack.distribution = UIStackViewDistributionFill;
-    [scroll addSubview:stack];
-    self.stackView = stack;
+    [self updateTabAppearance];
+    [self updateExpandButtonGlyph];
 }
+
+#pragma mark - Attach & Layout (Logo-Clear 16:9 + Full-Screen Rounded)
 
 - (void)attachToWindow:(UIWindow *)window {
     @try {
@@ -337,19 +443,55 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         if (window.subviews.lastObject != self) {
             [window bringSubviewToFront:self];
         }
-        // Initial position: top-right inside safe area.
-        if (!self.logoPositioned && window.bounds.size.width > kLogoSize + 32) {
-            UIEdgeInsets safe = [self ftcSafeInsets];
-            self.logoButton.frame = CGRectMake(window.bounds.size.width - kLogoSize - MAX(16.0, safe.right),
-                                               MAX(16.0, safe.top),
-                                               kLogoSize, kLogoSize);
-            self.logoPositioned = YES;
+        [self ensureLogoPositioned];
+        [self layoutFpsBadge];
+        if (_menuOpen) {
+            [self layoutPanel];
         }
-        [self layoutPanel];
-        if (!self.contentBuilt) {
-            [self rebuildContent];
-            self.contentBuilt = YES;
+        [self scheduleStaggeredRestoreIfNeeded];
+    } @catch (...) {}
+}
+
+- (void)ensureLogoPositioned {
+    CGFloat bw = self.bounds.size.width;
+    CGFloat bh = self.bounds.size.height;
+    if (bw < 100 || bh < 100) return;
+    UIEdgeInsets safe = [self ftcSafeInsets];
+    CGFloat maxX = MAX(safe.left, bw - kLogoSize - safe.right);
+    CGFloat maxY = MAX(safe.top, bh - kLogoSize - safe.bottom);
+    if (!self.logoPositioned) {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        CGFloat x, y;
+        if ([ud objectForKey:kPrefLogoX] && [ud objectForKey:kPrefLogoY]) {
+            x = (CGFloat)[ud doubleForKey:kPrefLogoX];
+            y = (CGFloat)[ud doubleForKey:kPrefLogoY];
+        } else {
+            x = maxX - 4.0;
+            y = safe.top + 8.0;
         }
+        x = MAX(safe.left, MIN(x, maxX));
+        y = MAX(safe.top, MIN(y, maxY));
+        self.logoButton.frame = CGRectMake(x, y, kLogoSize, kLogoSize);
+        self.logoPositioned = YES;
+    } else {
+        CGRect f = self.logoButton.frame;
+        f.origin.x = MAX(safe.left, MIN(f.origin.x, maxX));
+        f.origin.y = MAX(safe.top, MIN(f.origin.y, maxY));
+        self.logoButton.frame = f;
+    }
+}
+
+- (void)layoutFpsBadge {
+    @try {
+        CGFloat bw = self.bounds.size.width;
+        CGFloat bh = self.bounds.size.height;
+        if (bw < 100 || bh < 100) return;
+        UIEdgeInsets safe = [self ftcSafeInsets];
+        CGFloat badgeW = 64.0;
+        CGFloat badgeH = 24.0;
+        self.fpsBadge.frame = CGRectMake(safe.left,
+                                         bh - safe.bottom - badgeH,
+                                         badgeW, badgeH);
     } @catch (...) {}
 }
 
@@ -360,32 +502,20 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
             [self.superview bringSubviewToFront:self];
         }
         if (self.bounds.size.width < 100 || self.bounds.size.height < 100) return;
-
-        UIEdgeInsets safe = [self ftcSafeInsets];
-        if (!self.logoPositioned) {
-            self.logoButton.frame = CGRectMake(self.bounds.size.width - kLogoSize - MAX(16.0, safe.right),
-                                               MAX(16.0, safe.top),
-                                               kLogoSize, kLogoSize);
-            self.logoPositioned = YES;
-        } else {
-            // Keep the logo inside the window after rotation / resize.
-            CGRect f = self.logoButton.frame;
-            CGFloat maxX = MAX(safe.left, self.bounds.size.width - kLogoSize - safe.right);
-            CGFloat maxY = MAX(safe.top, self.bounds.size.height - kLogoSize - safe.bottom);
-            f.origin.x = MAX(safe.left, MIN(f.origin.x, maxX));
-            f.origin.y = MAX(safe.top, MIN(f.origin.y, maxY));
-            self.logoButton.frame = f;
-        }
-
-        // Only reposition the panel when the size actually changed: this
-        // keeps layoutSubviews idempotent and avoids any layout loop.
+        [self ensureLogoPositioned];
         if (!CGSizeEqualToSize(self.bounds.size, self.lastLayoutSize)) {
             self.lastLayoutSize = self.bounds.size;
-            [self layoutPanel];
+            [self layoutFpsBadge];
+            if (_menuOpen) {
+                [self layoutPanel];
+            }
         }
     } @catch (...) {}
 }
 
+// Compute panel frame strictly leaving a clear gap (`kLogoGap`) around the
+// floating demon mask logo so the panel NEVER covers the logo in either
+// Compact 16:9 or Maximized full-screen rounded mode.
 - (void)layoutPanel {
     @try {
         CGFloat bw = self.bounds.size.width;
@@ -393,458 +523,500 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         if (bw < 100 || bh < 100) return;
 
         UIEdgeInsets safe = [self ftcSafeInsets];
-        CGFloat availW = MAX(220.0, bw - safe.left - safe.right);
-        CGFloat availH = MAX(180.0, bh - safe.top - safe.bottom);
+        CGFloat safeLeft = safe.left;
+        CGFloat safeRight = bw - safe.right;
+        CGFloat safeTop = safe.top;
+        CGFloat safeBottom = bh - safe.bottom;
+        CGFloat availH = MAX(200.0, safeBottom - safeTop);
 
-        CGFloat pw = MIN(kPanelWidth, availW);
-        // On landscape screens (e.g. iPhone 7 Plus 736x414), let the panel
-        // use almost the full safe height and sit beside the logo when needed.
-        CGFloat ph;
         CGRect logo = self.logoButton.frame;
-        CGFloat spaceBelow = (bh - safe.bottom) - (logo.origin.y + kLogoSize + 8.0);
-        CGFloat spaceAbove = (logo.origin.y - 8.0) - safe.top;
-        CGFloat x, y;
+        CGFloat spaceLeft  = (logo.origin.x - kLogoGap) - safeLeft;
+        CGFloat spaceRight = safeRight - (logo.origin.x + kLogoSize + kLogoGap);
+        CGFloat spaceAbove = (logo.origin.y - kLogoGap) - safeTop;
+        CGFloat spaceBelow = safeBottom - (logo.origin.y + kLogoSize + kLogoGap);
 
-        if (spaceBelow >= 220.0 || spaceAbove >= 220.0) {
-            BOOL below = (spaceBelow >= spaceAbove);
-            CGFloat maxVert = below ? spaceBelow : spaceAbove;
-            ph = MIN(kPanelMaxHeight, MIN(availH, maxVert));
-            y = below ? (logo.origin.y + kLogoSize + 8.0)
-                      : (logo.origin.y - 8.0 - ph);
-            x = logo.origin.x + kLogoSize - pw;
-        } else {
-            // Landscape / mid-height logo: place panel beside the logo.
-            ph = MIN(kPanelMaxHeight, availH);
-            CGFloat spaceLeft = (logo.origin.x - 8.0) - safe.left;
-            CGFloat spaceRight = (bw - safe.right) - (logo.origin.x + kLogoSize + 8.0);
-            if (spaceLeft >= pw || spaceLeft >= spaceRight) {
-                x = logo.origin.x - 8.0 - pw;
+        CGFloat x, y, pw, ph;
+        // Prefer horizontal side with more space (natural for 16:9 landscape).
+        if (MAX(spaceLeft, spaceRight) >= 280.0) {
+            BOOL putLeft = (spaceLeft >= spaceRight);
+            CGFloat maxSideW = putLeft ? spaceLeft : spaceRight;
+            if (self.maximized) {
+                pw = maxSideW;
+                ph = availH;
+                y = safeTop;
             } else {
-                x = logo.origin.x + kLogoSize + 8.0;
+                pw = MIN(kCompactMaxW, maxSideW);
+                ph = MIN(kCompactMaxH, availH);
+                // Align vertically near the logo, clamped cleanly in safe bounds.
+                y = MAX(safeTop, MIN(logo.origin.y, safeBottom - ph));
             }
-            y = safe.top + (availH - ph) * 0.5;
+            x = putLeft ? (logo.origin.x - kLogoGap - pw)
+                        : (logo.origin.x + kLogoSize + kLogoGap);
+        } else {
+            // Fallback when logo sits horizontally centered: place above or below logo.
+            BOOL putBelow = (spaceBelow >= spaceAbove);
+            CGFloat maxVertH = MAX(180.0, putBelow ? spaceBelow : spaceAbove);
+            CGFloat availW = MAX(260.0, safeRight - safeLeft);
+            pw = self.maximized ? availW : MIN(kCompactMaxW, availW);
+            ph = self.maximized ? maxVertH : MIN(kCompactMaxH, maxVertH);
+            x = safeLeft + (availW - pw) * 0.5;
+            y = putBelow ? (logo.origin.y + kLogoSize + kLogoGap)
+                         : (logo.origin.y - kLogoGap - ph);
         }
 
-        // Hard-clamp inside safe bounds so the panel is NEVER off-screen.
-        x = MAX(safe.left, MIN(x, bw - safe.right - pw));
-        y = MAX(safe.top, MIN(y, bh - safe.bottom - ph));
-        self.panel.frame = CGRectMake(x, y, pw, ph);
+        x = MAX(safeLeft, MIN(x, safeRight - pw));
+        y = MAX(safeTop, MIN(y, safeBottom - ph));
+        self.panel.frame = CGRectMake(floor(x), floor(y), floor(pw), floor(ph));
+        self.panel.layer.cornerRadius = self.maximized ? 18.0 : 14.0;
 
-        // Header layout inside the panel.
-        UILabel *title = (UILabel *)[self.panel viewWithTag:1001];
-        if (title) title.frame = CGRectMake(0, 8, pw, 28);
-        CGFloat pillW = (pw - 32.0 - 16.0) / 3.0;
-        for (NSInteger i = 0; i < 3; i++) {
-            UIView *pill = [self.panel viewWithTag:2000 + i];
-            if (!pill) continue;
-            pill.frame = CGRectMake(16.0 + i * (pillW + 8.0), 42.0, pillW, 42.0);
-            UILabel *v = (UILabel *)[pill viewWithTag:2100 + i];
-            UILabel *l = (UILabel *)[pill viewWithTag:2200 + i];
-            if (v) v.frame = CGRectMake(0, 4, pillW, 17);
-            if (l) l.frame = CGRectMake(0, 22, pillW, 15);
+        // Chrome layout inside panel (pure CGRect math, 0 Auto Layout)
+        CGFloat W = self.panel.bounds.size.width;
+        CGFloat H = self.panel.bounds.size.height;
+
+        self.headerBar.frame = CGRectMake(0, 0, W, kHeaderH);
+        self.headerAccent.frame = CGRectMake(0, kHeaderH - 1.5, W, 1.5);
+        self.titleLabel.frame = CGRectMake(12, 0, 118, kHeaderH - 2);
+        self.activeCountBadge.frame = CGRectMake(130, (kHeaderH - 20) * 0.5, 58, 20);
+
+        CGFloat btnW = 30.0, btnH = 26.0, btnY = (kHeaderH - btnH) * 0.5;
+        self.minimizeButton.frame = CGRectMake(W - 10 - btnW, btnY, btnW, btnH);
+        self.expandButton.frame = CGRectMake(W - 10 - btnW - 6 - btnW, btnY, btnW, btnH);
+
+        CGFloat bodyY = kHeaderH;
+        CGFloat bodyH = MAX(80.0, H - bodyY);
+        CGFloat sideW = (W < 380.0) ? 88.0 : kSidebarW;
+        self.sidebar.frame = CGRectMake(0, bodyY, sideW, bodyH);
+        self.sidebarDivider.frame = CGRectMake(sideW, bodyY, 1.0, bodyH);
+
+        // Layout the 8 sidebar tabs evenly to fit bodyH with ZERO scrolling
+        CGFloat padY = 6.0;
+        CGFloat gapY = 3.0;
+        CGFloat tabH = floor((bodyH - padY * 2.0 - gapY * (kTabCount - 1)) / (CGFloat)kTabCount);
+        tabH = MAX(22.0, MIN(36.0, tabH));
+        for (NSInteger i = 0; i < kTabCount; i++) {
+            UIButton *tb = self.tabButtons[i];
+            tb.frame = CGRectMake(5.0, padY + i * (tabH + gapY), sideW - 10.0, tabH);
+            UIView *ind = self.tabIndicators[i];
+            ind.frame = CGRectMake(0, 4.0, 3.0, MAX(12.0, tabH - 8.0));
         }
 
-        CGFloat scrollY = 92.0;
-        CGFloat scrollH = MAX(60.0, ph - scrollY - 8.0);
-        CGFloat stackW = MAX(180.0, pw - 20.0);
-        self.scrollView.frame = CGRectMake(0, scrollY, pw, scrollH);
-        self.stackView.frame = CGRectMake(10.0, 0, stackW, self.contentHeight);
-        self.scrollView.contentSize = CGSizeMake(stackW, self.contentHeight);
+        CGFloat contentX = sideW + 1.0;
+        CGFloat contentW = MAX(140.0, W - contentX);
+        self.scrollView.frame = CGRectMake(contentX, bodyY, contentW, bodyH);
 
-        // FPS badge: right of logo if room, otherwise left of logo so it never clips.
-        CGFloat badgeW = 68.0;
-        CGFloat badgeH = 26.0;
-        CGFloat badgeX = logo.origin.x + kLogoSize + 8.0;
-        if (badgeX + badgeW > bw - safe.right) {
-            badgeX = logo.origin.x - 8.0 - badgeW;
+        // Only rebuild/re-layout active tab's cards when scroll width changed or empty.
+        if (fabs(contentW - self.lastScrollWidth) > 1.0 || self.scrollView.subviews.count == 0) {
+            self.lastScrollWidth = contentW;
+            [self buildActiveTabCards];
         }
-        badgeX = MAX(safe.left, MIN(badgeX, bw - safe.right - badgeW));
-        self.fpsBadge.frame = CGRectMake(badgeX, logo.origin.y + (kLogoSize - badgeH) * 0.5, badgeW, badgeH);
     } @catch (...) {}
 }
 
-// CRITICAL FIX: assign directly to backing ivar `_menuOpen` instead of
-// `self.menuOpen = open` (which called setMenuOpen: recursively -> stack
-// overflow crash on every tap!).
 - (void)setMenuOpen:(BOOL)open {
     @try {
         _menuOpen = open;
         self.panel.hidden = !open;
-        self.logoButton.layer.borderColor = open ? FTC_Color(FTC_C_GOLD).CGColor
-                                                 : FTC_Color(FTC_C_GOLD3).CGColor;
         if (open) {
             [self layoutPanel];
-            if (!self.contentBuilt) {
-                [self rebuildContent];
-                self.contentBuilt = YES;
-            }
+            [self updateActiveCountBadge];
+            [self updateTabAppearance];
         }
-    } @catch (...) { /* opening must never crash the game */ }
-}
-
-#pragma mark - Content building (only on interaction)
-
-- (UIButton *)sectionHeaderWithTitle:(NSString *)title count:(NSString *)count
-                                open:(BOOL)open action:(SEL)action tag:(NSInteger)tag {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    [b setTitle:[NSString stringWithFormat:@"%@   %@  (%@)", open ? @"▾" : @"▸", title, count]
-       forState:UIControlStateNormal];
-    b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    [b setTitleColor:FTC_Color(FTC_C_GOLD) forState:UIControlStateNormal];
-    b.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    b.contentEdgeInsets = UIEdgeInsetsMake(10, 12, 10, 12);
-#pragma clang diagnostic pop
-    b.backgroundColor = [FTC_Color(FTC_C_ACCENT) colorWithAlphaComponent:0.14];
-    b.layer.cornerRadius = 12;
-    b.tag = tag;
-    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
-    [b.heightAnchor constraintEqualToConstant:48].active = YES;
-    return b;
-}
-
-- (void)rebuildContent {
-    @try {
-        CGPoint savedOffset = self.scrollView.contentOffset;
-        NSArray<UIView *> *existing = [self.stackView.arrangedSubviews copy];
-        for (UIView *v in existing) {
-            [self.stackView removeArrangedSubview:v];
-            [v removeFromSuperview];
-        }
-
-        CGFloat totalH = 0;
-        NSInteger itemCount = 0;
-
-        // CHEAT ENGINE group (37 features: all except setting's 2).
-        NSInteger engineCount = 0;
-        for (size_t i = 0; i < kFTC_FeatureCount; i++) {
-            if (strcmp(kFTC_Features[i].category, "setting") != 0) engineCount++;
-        }
-        UIButton *engHead = [self sectionHeaderWithTitle:@"CHEAT ENGINE"
-                                                   count:[NSString stringWithFormat:@"%ld tinh nang", (long)engineCount]
-                                                    open:self.engineOpen
-                                                  action:@selector(onToggleEngine) tag:1];
-        [self.stackView addArrangedSubview:engHead];
-        totalH += 48.0;
-        itemCount++;
-
-        if (self.engineOpen) {
-            for (size_t c = 0; c < kCategoryCount; c++) {
-                totalH += [self addCategoryAtIndex:c countOut:&itemCount];
-            }
-        }
-
-        // SETTING group (2 features: #32, #40).
-        UIButton *setHead = [self sectionHeaderWithTitle:@"SETTING" count:@"2 muc"
-                                                    open:self.settingOpen
-                                                  action:@selector(onToggleSetting) tag:2];
-        [self.stackView addArrangedSubview:setHead];
-        totalH += 48.0;
-        itemCount++;
-
-        if (self.settingOpen) {
-            for (size_t i = 0; i < kFTC_FeatureCount; i++) {
-                if (strcmp(kFTC_Features[i].category, "setting") == 0) {
-                    CGFloat rh = 0;
-                    [self.stackView addArrangedSubview:[self rowForFeature:&kFTC_Features[i] heightOut:&rh]];
-                    totalH += rh;
-                    itemCount++;
-                }
-            }
-        }
-
-        if (itemCount > 1) {
-            totalH += (CGFloat)(itemCount - 1) * self.stackView.spacing;
-        }
-        totalH += 8.0; // bottom breathing room
-        self.contentHeight = totalH;
-
-        CGFloat stackW = MAX(180.0, self.scrollView.bounds.size.width - 20.0);
-        self.stackView.frame = CGRectMake(10.0, 0, stackW, totalH);
-        self.scrollView.contentSize = CGSizeMake(stackW, totalH);
-        [self.stackView layoutIfNeeded];
-
-        // Restore scroll offset cleanly without jumping past new bounds.
-        CGFloat maxOffsetY = MAX(0.0, totalH - self.scrollView.bounds.size.height);
-        savedOffset.y = MAX(0.0, MIN(savedOffset.y, maxOffsetY));
-        savedOffset.x = 0.0;
-        self.scrollView.contentOffset = savedOffset;
     } @catch (...) {}
 }
 
-- (CGFloat)addCategoryAtIndex:(size_t)idx countOut:(NSInteger *)countOut {
-    FTCCategory cat = kCategories[idx];
+- (void)onMinimizeTap {
+    [self setMenuOpen:NO];
+}
+
+- (void)onExpandTap {
+    self.maximized = !self.maximized;
+    [self updateExpandButtonGlyph];
+    [[NSUserDefaults standardUserDefaults] setBool:self.maximized forKey:kPrefMaximized];
+    [self layoutPanel];
+}
+
+- (void)updateExpandButtonGlyph {
+    [self.expandButton setTitle:(self.maximized ? @"⤡" : @"⤢") forState:UIControlStateNormal];
+}
+
+#pragma mark - Tabs & Pure Manual-Frame Cards (Zero Auto Layout, Zero Scroll Lag)
+
+- (void)onSelectTab:(UIButton *)sender {
+    NSInteger idx = sender.tag;
+    if (idx < 0 || idx >= kTabCount) return;
+    if (idx == self.selectedTab && self.scrollView.subviews.count > 0) return;
+    self.selectedTab = idx;
+    [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kPrefTab];
+    [self updateTabAppearance];
+    self.scrollView.contentOffset = CGPointZero;
+    [self buildActiveTabCards];
+}
+
+- (void)updateTabAppearance {
+    for (NSInteger i = 0; i < kTabCount; i++) {
+        UIButton *tb = self.tabButtons[i];
+        UIView *ind = self.tabIndicators[i];
+        BOOL active = (i == self.selectedTab);
+        NSInteger onCount = [self activeFeatureCountInTab:i];
+        NSString *baseName = [NSString stringWithUTF8String:kTabs[i].name];
+        NSString *label = (onCount > 0)
+            ? [NSString stringWithFormat:@"%@ (%ld)", baseName, (long)onCount]
+            : baseName;
+        [tb setTitle:label forState:UIControlStateNormal];
+        tb.backgroundColor = active ? FTC_Color(FTC_C_TAB_ON) : FTC_Color(FTC_C_SIDEBAR);
+        [tb setTitleColor:active ? FTC_Color(FTC_C_GOLD)
+                                 : (onCount > 0 ? FTC_Color(FTC_C_CRIMSON_HI) : FTC_Color(FTC_C_TEXT2))
+                 forState:UIControlStateNormal];
+        ind.hidden = !active;
+    }
+}
+
+- (NSInteger)activeFeatureCountInTab:(NSInteger)tabIdx {
+    const char *cid = kTabs[tabIdx].cid;
     NSInteger count = 0;
     for (size_t i = 0; i < kFTC_FeatureCount; i++) {
-        if (strcmp(kFTC_Features[i].category, cat.cid) == 0) count++;
-    }
-    NSString *key = [NSString stringWithUTF8String:cat.cid];
-    BOOL open = [self.catOpen[key] boolValue]; // mockup default: closed
-    UIButton *head = [UIButton buttonWithType:UIButtonTypeCustom];
-    [head setTitle:[NSString stringWithFormat:@"%@ %@  (%ld muc)", open ? @"▾" : @"▸",
-                    [NSString stringWithUTF8String:cat.name], (long)count]
-          forState:UIControlStateNormal];
-    head.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    [head setTitleColor:FTC_Color(FTC_C_GOLD) forState:UIControlStateNormal];
-    head.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    head.contentEdgeInsets = UIEdgeInsetsMake(8, 10, 8, 10);
-#pragma clang diagnostic pop
-    head.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.28];
-    head.layer.cornerRadius = 12;
-    head.tag = 100 + (NSInteger)idx;
-    [head.heightAnchor constraintEqualToConstant:42].active = YES;
-    [head addTarget:self action:@selector(onToggleCategory:) forControlEvents:UIControlEventTouchUpInside];
-    [self.stackView addArrangedSubview:head];
-
-    CGFloat addedH = 42.0;
-    if (countOut) (*countOut)++;
-    if (!open) return addedH;
-
-    for (size_t i = 0; i < kFTC_FeatureCount; i++) {
-        if (strcmp(kFTC_Features[i].category, cat.cid) == 0) {
-            CGFloat rh = 0;
-            [self.stackView addArrangedSubview:[self rowForFeature:&kFTC_Features[i] heightOut:&rh]];
-            addedH += rh;
-            if (countOut) (*countOut)++;
+        const FTC_Feature *f = &kFTC_Features[i];
+        if (strcmp(f->category, cid) != 0) continue;
+        if ((f->kind == FTC_KIND_PATCH || f->kind == FTC_KIND_DEV_TOGGLE) &&
+            [self.switchOn[@(f->fid)] boolValue]) {
+            count++;
+        } else if (f->fid == 42 && [self.modeIndex[@(42)] integerValue] > 0) {
+            count++;
         }
     }
-    return addedH;
+    return count;
 }
 
-- (UIView *)rowForFeature:(const FTC_Feature *)f heightOut:(CGFloat *)heightOut {
-    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 56)];
-    row.backgroundColor = [FTC_Color(FTC_C_TEXT) colorWithAlphaComponent:0.035];
-    row.layer.borderColor = [FTC_Color(FTC_C_GOLD2) colorWithAlphaComponent:0.16].CGColor;
-    row.layer.borderWidth = 1.0;
-    row.layer.cornerRadius = 14.0;
+- (void)updateActiveCountBadge {
+    NSInteger total = 0;
+    for (NSInteger i = 0; i < kTabCount; i++) total += [self activeFeatureCountInTab:i];
+    self.activeCountBadge.text = [NSString stringWithFormat:@"%ld BAT", (long)total];
+}
+
+// Build ONLY the 1..8 cards for the currently selected tab using pure manual CGRects.
+// In 2-column grid mode (when contentW >= 420pt), nearly every tab fits on 1 screen
+// without scrolling!
+- (void)buildActiveTabCards {
+    @try {
+        for (UIView *sub in [self.scrollView.subviews copy]) {
+            [sub removeFromSuperview];
+        }
+        [self.cardMap removeAllObjects];
+        [self.subLabelMap removeAllObjects];
+        [self.switchMap removeAllObjects];
+        [self.stepValMap removeAllObjects];
+        [self.segMap removeAllObjects];
+        self.resetAllButton = nil;
+
+        CGFloat W = self.scrollView.bounds.size.width;
+        if (W < 120.0) return;
+
+        const char *cid = kTabs[self.selectedTab].cid;
+        CGFloat pad = 8.0;
+        CGFloat gap = 7.0;
+        BOOL twoCol = (W >= 415.0);
+        CGFloat colW = twoCol ? floor((W - pad * 2.0 - gap) * 0.5) : (W - pad * 2.0);
+
+        CGFloat colY[2] = { pad, pad };
+
+        for (size_t i = 0; i < kFTC_FeatureCount; i++) {
+            const FTC_Feature *f = &kFTC_Features[i];
+            if (strcmp(f->category, cid) != 0) continue;
+
+            // Wide controls (STEP / MODE / combined secondary buttons) span full width
+            // when in 2-col mode if single column would be cramped.
+            BOOL forceFull = (twoCol && colW < 235.0 &&
+                              (f->kind == FTC_KIND_STEP || f->kind == FTC_KIND_MODE ||
+                               f->fid == 4 || f->fid == 7 || f->fid == 24));
+            CGFloat cardW = forceFull ? (W - pad * 2.0) : colW;
+            CGFloat cardH = (f->fid == 12) ? 74.0 : 58.0;
+
+            CGFloat cx, cy;
+            if (!twoCol || forceFull) {
+                cy = MAX(colY[0], colY[1]);
+                cx = pad;
+                colY[0] = cy + cardH + gap;
+                colY[1] = colY[0];
+            } else {
+                NSInteger col = (colY[0] <= colY[1]) ? 0 : 1;
+                cx = pad + col * (colW + gap);
+                cy = colY[col];
+                colY[col] = cy + cardH + gap;
+            }
+
+            UIView *card = [self makeCardForFeature:f frame:CGRectMake(cx, cy, cardW, cardH)];
+            [self.scrollView addSubview:card];
+        }
+
+        CGFloat totalH = MAX(colY[0], colY[1]);
+
+        // In "Cai dat" tab, add a convenient "Tat het cheat & xoa cau hinh luu" button.
+        if (strcmp(cid, "setting") == 0) {
+            UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            resetBtn.frame = CGRectMake(pad, totalH + 2.0, W - pad * 2.0, 34.0);
+            [resetBtn setTitle:@"Tat het cheat & Xoa cau hinh da luu" forState:UIControlStateNormal];
+            resetBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            [resetBtn setTitleColor:FTC_Color(FTC_C_CRIMSON_HI) forState:UIControlStateNormal];
+            resetBtn.backgroundColor = FTC_Color(FTC_C_TAB_ON);
+            resetBtn.opaque = YES;
+            resetBtn.layer.cornerRadius = 10.0;
+            resetBtn.layer.borderColor = FTC_Color(FTC_C_CRIMSON).CGColor;
+            resetBtn.layer.borderWidth = 1.0;
+            [resetBtn addTarget:self action:@selector(onResetAllCheats) forControlEvents:UIControlEventTouchUpInside];
+            [self.scrollView addSubview:resetBtn];
+            self.resetAllButton = resetBtn;
+            totalH += 44.0;
+        }
+
+        self.scrollView.contentSize = CGSizeMake(W, MAX(totalH + 4.0, self.scrollView.bounds.size.height));
+    } @catch (...) {}
+}
+
+- (UIView *)makeCardForFeature:(const FTC_Feature *)f frame:(CGRect)frame {
+    CGFloat W = frame.size.width;
+    CGFloat H = frame.size.height;
     BOOL on = [self.switchOn[@(f->fid)] boolValue];
-    if (on) {
-        row.layer.borderColor = [FTC_Color(FTC_C_ACCENT) colorWithAlphaComponent:0.55].CGColor;
-        row.backgroundColor = [FTC_Color(FTC_C_ACCENT) colorWithAlphaComponent:0.09];
-    }
 
-    UIButton *nameBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-    NSString *name = [NSString stringWithUTF8String:f->name];
-    [nameBtn setTitle:name forState:UIControlStateNormal];
-    nameBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-    nameBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    nameBtn.titleLabel.numberOfLines = 2;
-    [nameBtn setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
-    nameBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    nameBtn.tag = f->fid;
-    [nameBtn addTarget:self action:@selector(onToggleDesc:) forControlEvents:UIControlEventTouchUpInside];
-    nameBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addSubview:nameBtn];
+    UIView *card = [[UIView alloc] initWithFrame:frame];
+    card.opaque = YES;
+    card.backgroundColor = on ? FTC_Color(FTC_C_CARD_ON) : FTC_Color(FTC_C_CARD);
+    card.layer.borderColor = on ? FTC_Color(FTC_C_CRIMSON).CGColor : FTC_Color(FTC_C_BORDER).CGColor;
+    card.layer.borderWidth = 1.0;
+    card.layer.cornerRadius = 11.0;
+    self.cardMap[@(f->fid)] = card;
 
+    // Right control area width
     BOOL hasSecondary = (f->fid == 4 || f->fid == 7 || f->fid == 24);
-    CGFloat nameTrailing = -82.0;
-    if (f->kind == FTC_KIND_STEP) nameTrailing = -188.0;
-    else if (f->kind == FTC_KIND_MODE) nameTrailing = -164.0;
-    else if (hasSecondary) nameTrailing = -152.0;
+    CGFloat ctrlAreaW = 66.0;
+    if (f->kind == FTC_KIND_STEP) ctrlAreaW = 178.0;
+    else if (f->kind == FTC_KIND_MODE) ctrlAreaW = (f->fid == 42) ? 168.0 : 148.0;
+    else if (hasSecondary) ctrlAreaW = 136.0;
 
-    // Status line (last result / "chua goi duoc"), shown under the name.
-    NSString *status = self.statusText[@(f->fid)];
-    BOOL descShown = [self.descOpen[@(f->fid)] boolValue];
-    CGFloat rowHeight = (f->fid == 12) ? 74.0 : 56.0;
-    if (descShown || status) {
-        rowHeight = (f->fid == 12) ? 108.0 : 94.0;
-        UILabel *sub = [[UILabel alloc] initWithFrame:CGRectZero];
-        sub.numberOfLines = 3;
-        sub.font = [UIFont systemFontOfSize:11];
-        sub.textColor = FTC_Color(FTC_C_TEXT3);
-        NSMutableString *t = [NSMutableString string];
-        if (descShown) [t appendString:[NSString stringWithUTF8String:f->desc]];
-        if (status) {
-            if (t.length) [t appendString:@"\n"];
-            [t appendString:status];
-        }
-        sub.text = t;
-        sub.translatesAutoresizingMaskIntoConstraints = NO;
-        [row addSubview:sub];
-        [NSLayoutConstraint activateConstraints:@[
-            [sub.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],
-            [sub.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:nameTrailing],
-            [sub.topAnchor constraintEqualToAnchor:nameBtn.bottomAnchor constant:2],
-            [sub.bottomAnchor constraintLessThanOrEqualToAnchor:row.bottomAnchor constant:-4],
-        ]];
-    }
-    if (heightOut) *heightOut = rowHeight;
-    [row.heightAnchor constraintEqualToConstant:rowHeight].active = YES;
+    CGFloat textW = MAX(60.0, W - ctrlAreaW - 18.0);
 
-    [NSLayoutConstraint activateConstraints:@[
-        [nameBtn.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:10],
-        [nameBtn.topAnchor constraintEqualToAnchor:row.topAnchor constant:6],
-        [nameBtn.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:nameTrailing],
-        [nameBtn.heightAnchor constraintEqualToConstant:36],
-    ]];
+    // Feature title button (tap title to toggle short Vietnamese description in subtitle)
+    UIButton *titleBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    titleBtn.frame = CGRectMake(10, 6, textW, 22);
+    [titleBtn setTitle:[NSString stringWithUTF8String:f->name] forState:UIControlStateNormal];
+    titleBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.5];
+    titleBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [titleBtn setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+    titleBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    titleBtn.tag = f->fid;
+    [titleBtn addTarget:self action:@selector(onToggleDesc:) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:titleBtn];
 
-    UIView *control = [self controlForFeature:f];
-    control.translatesAutoresizingMaskIntoConstraints = NO;
-    [row addSubview:control];
-    [NSLayoutConstraint activateConstraints:@[
-        [control.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-8],
-        [control.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-    ]];
+    // Subtitle / live status line (updated in-place without rebuilding any view)
+    UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(10, 28, textW, H - 32)];
+    sub.font = [UIFont systemFontOfSize:10.5];
+    sub.numberOfLines = 2;
+    sub.lineBreakMode = NSLineBreakByTruncatingTail;
+    [card addSubview:sub];
+    self.subLabelMap[@(f->fid)] = sub;
+    [self refreshCardSubtitle:f];
 
-    // Secondary one-shot buttons inside combined rows (#4, #7, #24).
-    if (hasSecondary) {
-        UIButton *extra = [UIButton buttonWithType:UIButtonTypeSystem];
-        NSString *t = (f->fid == 4) ? @"Doi mode" : (f->fid == 7) ? @"Giet ngay" : @"Chon kiem";
-        [extra setTitle:t forState:UIControlStateNormal];
-        extra.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-        [extra setTitleColor:FTC_Color(FTC_C_GOLD2) forState:UIControlStateNormal];
-        extra.tag = f->fid;
-        [extra addTarget:self action:@selector(onSecondary:) forControlEvents:UIControlEventTouchUpInside];
-        extra.translatesAutoresizingMaskIntoConstraints = NO;
-        [row addSubview:extra];
-        [NSLayoutConstraint activateConstraints:@[
-            [extra.trailingAnchor constraintEqualToAnchor:control.leadingAnchor constant:-6],
-            [extra.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        ]];
-    }
-    return row;
-}
-
-- (UIView *)controlForFeature:(const FTC_Feature *)f {
+    // Control on the right side (manual frames, 0 Auto Layout)
     switch (f->kind) {
         case FTC_KIND_PATCH:
         case FTC_KIND_DEV_TOGGLE: {
             UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            sw.on = [self.switchOn[@(f->fid)] boolValue];
-            sw.onTintColor = FTC_Color(FTC_C_ACCENT);
+            CGSize sz = sw.intrinsicContentSize;
+            sw.frame = CGRectMake(W - sz.width - 8.0, floor((H - sz.height) * 0.5), sz.width, sz.height);
+            sw.on = on;
+            sw.onTintColor = FTC_Color(FTC_C_CRIMSON);
             sw.tag = f->fid;
             [sw addTarget:self action:@selector(onSwitch:) forControlEvents:UIControlEventValueChanged];
-            return sw;
+            [card addSubview:sw];
+            self.switchMap[@(f->fid)] = sw;
+
+            if (hasSecondary) {
+                UIButton *ex = [self makeSecondaryButtonForFeature:f
+                                                             frame:CGRectMake(sw.frame.origin.x - 72.0,
+                                                                              floor((H - 28.0) * 0.5), 66.0, 28.0)];
+                [card addSubview:ex];
+            }
+            break;
         }
         case FTC_KIND_ONESHOT: {
-            UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+            UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+            b.frame = CGRectMake(W - 62.0, floor((H - 30.0) * 0.5), 54.0, 30.0);
             [b setTitle:@"Chay" forState:UIControlStateNormal];
-            b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
-            [b setTitleColor:FTC_Color(FTC_C_ONACC) forState:UIControlStateNormal];
-            b.backgroundColor = FTC_Color(FTC_C_ACCENT3);
-            b.layer.cornerRadius = 10;
+            b.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+            [b setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+            b.backgroundColor = FTC_Color(FTC_C_CRIMSON);
+            b.opaque = YES;
+            b.layer.cornerRadius = 8.0;
             b.tag = f->fid;
-            [b.widthAnchor constraintEqualToConstant:64].active = YES;
-            [b.heightAnchor constraintEqualToConstant:34].active = YES;
             [b addTarget:self action:@selector(onOneshot:) forControlEvents:UIControlEventTouchUpInside];
-            return b;
+            [card addSubview:b];
+
+            if (hasSecondary) {
+                UIButton *ex = [self makeSecondaryButtonForFeature:f
+                                                             frame:CGRectMake(b.frame.origin.x - 74.0,
+                                                                              floor((H - 30.0) * 0.5), 68.0, 30.0)];
+                [card addSubview:ex];
+            }
+            break;
         }
         case FTC_KIND_MODE: {
             UISegmentedControl *seg = nil;
+            CGFloat segW = 142.0;
             if (f->fid == 28) {
                 seg = [[UISegmentedControl alloc] initWithItems:@[@"-1 ngay", @"+1 ngay"]];
-                // Momentary so tapping "+1 ngay" or "-1 ngay" repeatedly fires every time.
                 seg.momentary = YES;
             } else if (f->fid == 32) {
                 seg = [[UISegmentedControl alloc] initWithItems:@[@"Thap", @"Vua", @"Cao"]];
-                seg.selectedSegmentIndex = [self.modeIndex[@(f->fid)] integerValue];
+                seg.selectedSegmentIndex = [self.modeIndex[@(32)] integerValue];
+            } else if (f->fid == 42) {
+                seg = [[UISegmentedControl alloc] initWithItems:@[@"1x", @"1.5x", @"2x", @"3x"]];
+                seg.selectedSegmentIndex = [self.modeIndex[@(42)] integerValue];
+                segW = 162.0;
             } else {
                 seg = [[UISegmentedControl alloc] initWithItems:@[@"--"]];
             }
+            seg.frame = CGRectMake(W - segW - 8.0, floor((H - 30.0) * 0.5), segW, 30.0);
             seg.tag = f->fid;
-            [seg.widthAnchor constraintEqualToConstant:150].active = YES;
-            [seg.heightAnchor constraintEqualToConstant:32].active = YES;
+            seg.selectedSegmentTintColor = FTC_Color(FTC_C_CRIMSON);
             [seg setTitleTextAttributes:@{
-                NSFontAttributeName: [UIFont boldSystemFontOfSize:12],
+                NSFontAttributeName: [UIFont boldSystemFontOfSize:11],
                 NSForegroundColorAttributeName: FTC_Color(FTC_C_TEXT)
             } forState:UIControlStateNormal];
             [seg addTarget:self action:@selector(onSegment:) forControlEvents:UIControlEventValueChanged];
-            return seg;
+            [card addSubview:seg];
+            self.segMap[@(f->fid)] = seg;
+            break;
         }
         case FTC_KIND_STEP: {
             if (f->fid == 12) {
-                UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 174, 60)];
-                [wrap.widthAnchor constraintEqualToConstant:174].active = YES;
-                [wrap.heightAnchor constraintEqualToConstant:60].active = YES;
-                // Ticket kind picker + "+1 ve" button.
+                CGFloat sx = W - 176.0;
                 UISegmentedControl *seg = [[UISegmentedControl alloc]
                     initWithItems:@[@"Dmg", @"Hold", @"Succ", @"Great"]];
-                seg.frame = CGRectMake(0, 0, 174, 28);
-                seg.selectedSegmentIndex = [self.modeIndex[@(f->fid)] integerValue];
-                seg.tag = f->fid;
+                seg.frame = CGRectMake(sx, 7.0, 168.0, 26.0);
+                seg.selectedSegmentIndex = [self.modeIndex[@(12)] integerValue];
+                seg.tag = 12;
+                seg.selectedSegmentTintColor = FTC_Color(FTC_C_CRIMSON);
                 [seg setTitleTextAttributes:@{
                     NSFontAttributeName: [UIFont boldSystemFontOfSize:10],
                     NSForegroundColorAttributeName: FTC_Color(FTC_C_TEXT)
                 } forState:UIControlStateNormal];
                 [seg addTarget:self action:@selector(onTicketKind:) forControlEvents:UIControlEventValueChanged];
-                [wrap addSubview:seg];
+                [card addSubview:seg];
 
-                UIButton *plus = [UIButton buttonWithType:UIButtonTypeSystem];
+                UIButton *plus = [UIButton buttonWithType:UIButtonTypeCustom];
+                plus.frame = CGRectMake(W - 76.0, 39.0, 68.0, 26.0);
                 [plus setTitle:@"+1 ve" forState:UIControlStateNormal];
-                plus.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-                [plus setTitleColor:FTC_Color(FTC_C_ONACC) forState:UIControlStateNormal];
-                plus.backgroundColor = FTC_Color(FTC_C_ACCENT3);
-                plus.layer.cornerRadius = 8;
-                plus.frame = CGRectMake(104, 32, 70, 26);
-                plus.tag = f->fid;
+                plus.titleLabel.font = [UIFont boldSystemFontOfSize:11.5];
+                [plus setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+                plus.backgroundColor = FTC_Color(FTC_C_CRIMSON);
+                plus.opaque = YES;
+                plus.layer.cornerRadius = 7.0;
+                plus.tag = 12;
                 [plus addTarget:self action:@selector(onTicketPlus:) forControlEvents:UIControlEventTouchUpInside];
-                [wrap addSubview:plus];
-                return wrap;
+                [card addSubview:plus];
+            } else {
+                CGFloat sx = W - 178.0;
+                CGFloat sy = floor((H - 29.0) * 0.5);
+                UIStepper *stepper = [[UIStepper alloc] initWithFrame:CGRectMake(sx, sy, 94.0, 29.0)];
+                stepper.tag = f->fid;
+                NSInteger v = [self.stepValue[@(f->fid)] integerValue];
+                if (f->fid == 6) { stepper.minimumValue = 0; stepper.maximumValue = 999; stepper.stepValue = 10; }
+                if (f->fid == 9) { stepper.minimumValue = 1; stepper.maximumValue = 24; stepper.stepValue = 1; }
+                stepper.value = v;
+                [stepper addTarget:self action:@selector(onStepper:) forControlEvents:UIControlEventValueChanged];
+                [card addSubview:stepper];
+
+                UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(sx + 96.0, sy, 32.0, 29.0)];
+                val.text = [NSString stringWithFormat:@"%ld", (long)v];
+                val.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightBold];
+                val.textColor = FTC_Color(FTC_C_GOLD);
+                val.textAlignment = NSTextAlignmentCenter;
+                [card addSubview:val];
+                self.stepValMap[@(f->fid)] = val;
+
+                UIButton *apply = [UIButton buttonWithType:UIButtonTypeCustom];
+                apply.frame = CGRectMake(sx + 130.0, sy, 42.0, 29.0);
+                [apply setTitle:(f->fid == 9) ? @"Nhay" : @"Dat" forState:UIControlStateNormal];
+                apply.titleLabel.font = [UIFont boldSystemFontOfSize:11.5];
+                [apply setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+                apply.backgroundColor = FTC_Color(FTC_C_CRIMSON);
+                apply.opaque = YES;
+                apply.layer.cornerRadius = 7.0;
+                apply.tag = f->fid;
+                [apply addTarget:self action:@selector(onStepApply:) forControlEvents:UIControlEventTouchUpInside];
+                [card addSubview:apply];
             }
-            UIView *wrap = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 176, 32)];
-            [wrap.widthAnchor constraintEqualToConstant:176].active = YES;
-            [wrap.heightAnchor constraintEqualToConstant:32].active = YES;
-
-            UIStepper *stepper = [[UIStepper alloc] initWithFrame:CGRectMake(0, 1, 94, 29)];
-            stepper.tag = f->fid;
-            NSInteger v = [self.stepValue[@(f->fid)] integerValue];
-            if (f->fid == 6) { stepper.minimumValue = 0; stepper.maximumValue = 999; stepper.stepValue = 10; }
-            if (f->fid == 9) { stepper.minimumValue = 1; stepper.maximumValue = 24; stepper.stepValue = 1; }
-            stepper.value = v;
-            [stepper addTarget:self action:@selector(onStepper:) forControlEvents:UIControlEventValueChanged];
-            [wrap addSubview:stepper];
-
-            UILabel *val = [[UILabel alloc] initWithFrame:CGRectMake(96, 1, 34, 29)];
-            val.text = [NSString stringWithFormat:@"%ld", (long)v];
-            val.font = [UIFont boldSystemFontOfSize:13];
-            val.textColor = FTC_Color(FTC_C_GOLD);
-            val.textAlignment = NSTextAlignmentCenter;
-            val.tag = 9000 + f->fid;
-            [wrap addSubview:val];
-
-            UIButton *apply = [UIButton buttonWithType:UIButtonTypeSystem];
-            [apply setTitle:(f->fid == 9) ? @"Nhay" : @"Dat" forState:UIControlStateNormal];
-            apply.titleLabel.font = [UIFont boldSystemFontOfSize:12];
-            [apply setTitleColor:FTC_Color(FTC_C_ONACC) forState:UIControlStateNormal];
-            apply.backgroundColor = FTC_Color(FTC_C_ACCENT3);
-            apply.layer.cornerRadius = 8;
-            apply.frame = CGRectMake(132, 1, 44, 29);
-            apply.tag = f->fid;
-            [apply addTarget:self action:@selector(onStepApply:) forControlEvents:UIControlEventTouchUpInside];
-            [wrap addSubview:apply];
-            return wrap;
+            break;
         }
     }
-    return [[UIView alloc] initWithFrame:CGRectZero];
+    return card;
 }
 
-#pragma mark - Section toggles
-
-- (void)onToggleEngine { self.engineOpen = !self.engineOpen; [self rebuildContent]; }
-- (void)onToggleSetting { self.settingOpen = !self.settingOpen; [self rebuildContent]; }
-
-- (void)onToggleCategory:(UIButton *)sender {
-    NSInteger idx = sender.tag - 100;
-    if (idx < 0 || idx >= (NSInteger)kCategoryCount) return;
-    NSString *key = [NSString stringWithUTF8String:kCategories[idx].cid];
-    self.catOpen[key] = @(![self.catOpen[key] boolValue]);
-    [self rebuildContent];
+- (UIButton *)makeSecondaryButtonForFeature:(const FTC_Feature *)f frame:(CGRect)frame {
+    UIButton *ex = [UIButton buttonWithType:UIButtonTypeCustom];
+    ex.frame = frame;
+    NSString *t = (f->fid == 4) ? @"Doi mode" : (f->fid == 7) ? @"Giet ngay" : @"Chon kiem";
+    [ex setTitle:t forState:UIControlStateNormal];
+    ex.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+    [ex setTitleColor:FTC_Color(FTC_C_GOLD) forState:UIControlStateNormal];
+    ex.backgroundColor = FTC_Color(FTC_C_BTN_BG);
+    ex.opaque = YES;
+    ex.layer.cornerRadius = 7.0;
+    ex.layer.borderColor = FTC_Color(FTC_C_BORDER_HI).CGColor;
+    ex.layer.borderWidth = 1.0;
+    ex.tag = f->fid;
+    [ex addTarget:self action:@selector(onSecondary:) forControlEvents:UIControlEventTouchUpInside];
+    return ex;
 }
 
-- (void)onToggleDesc:(UIButton *)sender {
-    NSNumber *key = @(sender.tag);
-    self.descOpen[key] = @(![self.descOpen[key] boolValue]);
-    [self rebuildContent];
+// Fast O(1) in-place UI refresh for one single card (ZERO view creation/destruction).
+- (void)refreshCardSubtitle:(const FTC_Feature *)f {
+    if (!f) return;
+    UILabel *sub = self.subLabelMap[@(f->fid)];
+    if (!sub) return;
+    NSString *status = self.statusText[@(f->fid)];
+    BOOL showDesc = [self.descOpen[@(f->fid)] boolValue];
+    NSInteger kind = [self.statusKind[@(f->fid)] integerValue];
+    if (showDesc) {
+        sub.text = [NSString stringWithUTF8String:f->desc];
+        sub.textColor = FTC_Color(FTC_C_TEXT2);
+    } else if (status.length > 0) {
+        sub.text = status;
+        sub.textColor = (kind == 1) ? FTC_Color(FTC_C_OK)
+                      : (kind == 2) ? FTC_Color(FTC_C_ERR)
+                                    : FTC_Color(FTC_C_TEXT2);
+    } else {
+        sub.text = [NSString stringWithUTF8String:f->desc];
+        sub.textColor = FTC_Color(FTC_C_TEXT2);
+    }
 }
 
-#pragma mark - Feature actions
+- (void)updateCardInPlace:(int)fid {
+    const FTC_Feature *f = FTC_FeatureById(fid);
+    if (!f) return;
+    BOOL on = [self.switchOn[@(fid)] boolValue];
+    UIView *card = self.cardMap[@(fid)];
+    if (card) {
+        card.backgroundColor = on ? FTC_Color(FTC_C_CARD_ON) : FTC_Color(FTC_C_CARD);
+        card.layer.borderColor = on ? FTC_Color(FTC_C_CRIMSON).CGColor : FTC_Color(FTC_C_BORDER).CGColor;
+    }
+    UISwitch *sw = self.switchMap[@(fid)];
+    if (sw && sw.isOn != on) {
+        [sw setOn:on animated:NO];
+    }
+    [self refreshCardSubtitle:f];
+    [self updateActiveCountBadge];
+    [self updateTabAppearance];
+}
 
-- (void)setStatus:(int)fid text:(NSString *)text {
-    if (text) self.statusText[@(fid)] = text;
-    else [self.statusText removeObjectForKey:@(fid)];
+- (void)setStatus:(int)fid text:(NSString *)text kind:(NSInteger)kind {
+    if (text) {
+        self.statusText[@(fid)] = text;
+        self.statusKind[@(fid)] = @(kind);
+        self.descOpen[@(fid)] = @(NO);
+    } else {
+        [self.statusText removeObjectForKey:@(fid)];
+        [self.statusKind removeObjectForKey:@(fid)];
+    }
 }
 
 - (NSString *)messageForCall:(FTC_CallResult)r {
@@ -859,60 +1031,291 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
     return vc;
 }
 
-// Patch toggles (#4, #5, #10-#11, #13-#22, #34-#36, #38-#39) and dev toggles
-// (#7 god, #33 shelf, #40 fps) share the switch UI but differ underneath:
-// patch toggles write bytes, dev toggles call a flipping dev method once.
+#pragma mark - Persistence (NSUserDefaults + Staggered Non-Blocking Startup Restore)
+
+- (void)loadSavedPreferences {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        self.maximized = [ud boolForKey:kPrefMaximized];
+        NSInteger savedTab = [ud integerForKey:kPrefTab];
+        if (savedTab >= 0 && savedTab < kTabCount) self.selectedTab = savedTab;
+        if ([ud objectForKey:kPrefQuality]) {
+            NSInteger q = [ud integerForKey:kPrefQuality];
+            if (q >= 0 && q <= 2) self.modeIndex[@(32)] = @(q);
+        }
+        if ([ud objectForKey:kPrefSpeed]) {
+            NSInteger sp = [ud integerForKey:kPrefSpeed];
+            if (sp >= 0 && sp <= 3) self.modeIndex[@(42)] = @(sp);
+        }
+    } @catch (...) {}
+}
+
+- (void)saveLogoPosition {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setDouble:self.logoButton.frame.origin.x forKey:kPrefLogoX];
+        [ud setDouble:self.logoButton.frame.origin.y forKey:kPrefLogoY];
+    } @catch (...) {}
+}
+
+- (void)saveSwitchState:(int)fid on:(BOOL)on {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSDictionary *old = [ud dictionaryForKey:kPrefSwitches];
+        NSMutableDictionary *m = old ? [old mutableCopy] : [NSMutableDictionary dictionary];
+        NSString *key = [NSString stringWithFormat:@"%d", fid];
+        if (on) m[key] = @(YES);
+        else [m removeObjectForKey:key];
+        [ud setObject:m forKey:kPrefSwitches];
+    } @catch (...) {}
+}
+
+// Staggered restore: waits 1.2s after game window attach, then applies saved
+// settings smoothly 1-by-1 (0.08s apart) so startup NEVER lags or stutters
+// even when many cheats were left ON.
+- (void)scheduleStaggeredRestoreIfNeeded {
+    if (self.restoreScheduled) return;
+    self.restoreScheduled = YES;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf beginStaggeredRestore];
+    });
+}
+
+- (void)beginStaggeredRestore {
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSDictionary *saved = [ud dictionaryForKey:kPrefSwitches];
+        NSMutableArray<dispatch_block_t> *queue = [NSMutableArray array];
+        __weak typeof(self) weakSelf = self;
+
+        // 1. FPS badge (instant, 0 game cost)
+        if ([saved[@"40"] boolValue]) {
+            self.switchOn[@(40)] = @(YES);
+            [self setStatus:40 text:@"Da bat (goc trai day)" kind:1];
+            [self setFpsBadgeVisible:YES];
+        }
+
+        // 2. Boost Max FPS (#41) or saved Quality Tier (#32)
+        if ([saved[@"41"] boolValue]) {
+            [queue addObject:^{
+                CheatMenuView *s = weakSelf;
+                if (!s) return;
+                if (FTC_SetAntiLag(true) == FTC_CALL_OK) {
+                    s.switchOn[@(41)] = @(YES);
+                    [s setStatus:41 text:@"Da khoi phuc" kind:1];
+                    [s updateCardInPlace:41];
+                }
+            }];
+        } else if ([ud objectForKey:kPrefQuality]) {
+            NSInteger qIdx = [ud integerForKey:kPrefQuality];
+            if (qIdx >= 0 && qIdx <= 2) {
+                [queue addObject:^{
+                    CheatMenuView *s = weakSelf;
+                    if (!s) return;
+                    if (FTC_SetQualityTier((int)qIdx) == FTC_CALL_OK) {
+                        s.modeIndex[@(32)] = @(qIdx);
+                        [s setStatus:32 text:@"Da khoi phuc" kind:1];
+                        [s updateCardInPlace:32];
+                    }
+                }];
+            }
+        }
+
+        // 3. Speed Hack (#42) if > 1x
+        if ([ud objectForKey:kPrefSpeed]) {
+            NSInteger spIdx = [ud integerForKey:kPrefSpeed];
+            if (spIdx > 0 && spIdx <= 3) {
+                [queue addObject:^{
+                    CheatMenuView *s = weakSelf;
+                    if (!s) return;
+                    if (FTC_SetTimeScale(kSpeedValues[spIdx]) == FTC_CALL_OK) {
+                        s.modeIndex[@(42)] = @(spIdx);
+                        [s setStatus:42 text:@"Da khoi phuc" kind:1];
+                        [s updateCardInPlace:42];
+                    }
+                }];
+            }
+        }
+
+        // 4. Saved runtime PATCH switches (staggered 1-by-1)
+        for (size_t i = 0; i < kFTC_FeatureCount; i++) {
+            const FTC_Feature *f = &kFTC_Features[i];
+            NSString *k = [NSString stringWithFormat:@"%d", f->fid];
+            if (![saved[k] boolValue]) continue;
+            if (f->kind == FTC_KIND_PATCH) {
+                int fid = f->fid;
+                [queue addObject:^{
+                    CheatMenuView *s = weakSelf;
+                    if (!s) return;
+                    FTC_PatchResult r = FTC_PatchApplyFeature(fid);
+                    if (r == FTC_PATCH_OK) {
+                        s.switchOn[@(fid)] = @(YES);
+                        [s setStatus:fid text:@"Da khoi phuc" kind:1];
+                    } else {
+                        s.switchOn[@(fid)] = @(NO);
+                        [s setStatus:fid text:[NSString stringWithUTF8String:FTC_PatchResultMessage(r)] kind:2];
+                    }
+                    [s updateCardInPlace:fid];
+                }];
+            } else if (f->fid == 7 || f->fid == 33) {
+                [self.pendingDevToggleFids addObject:@(f->fid)];
+            }
+        }
+
+        // Execute queued items spaced 80ms apart -> zero frame hitch!
+        for (NSUInteger idx = 0; idx < queue.count; idx++) {
+            dispatch_block_t task = queue[idx];
+            int64_t delayNs = (int64_t)(idx * 80 * NSEC_PER_MSEC);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNs),
+                           dispatch_get_main_queue(), task);
+        }
+
+        // Dev-toggles needing live ForgeRoom (#7, #33) retry gently until room loads.
+        if (self.pendingDevToggleFids.count > 0) {
+            self.pendingDevRestoreTries = 0;
+            [self tryRestorePendingDevToggles];
+        }
+        [self updateActiveCountBadge];
+        [self updateTabAppearance];
+    } @catch (...) {}
+}
+
+- (void)tryRestorePendingDevToggles {
+    @try {
+        if (self.pendingDevToggleFids.count == 0) return;
+        if (FTC_ToolsAvailable()) {
+            NSArray<NSNumber *> *items = [self.pendingDevToggleFids copy];
+            [self.pendingDevToggleFids removeAllObjects];
+            for (NSNumber *num in items) {
+                int fid = [num intValue];
+                FTC_CallResult cr = (fid == 7) ? FTC_ToggleGodMode()
+                                  : (fid == 33) ? FTC_ToggleMerchantShelfSlot()
+                                                : FTC_CALL_ERR_UNAVAILABLE;
+                if (cr == FTC_CALL_OK) {
+                    self.switchOn[@(fid)] = @(YES);
+                    [self setStatus:fid text:@"Da khoi phuc" kind:1];
+                    [self updateCardInPlace:fid];
+                }
+            }
+            return;
+        }
+        self.pendingDevRestoreTries++;
+        if (self.pendingDevRestoreTries < 20) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf tryRestorePendingDevToggles];
+            });
+        }
+    } @catch (...) {}
+}
+
+- (void)onResetAllCheats {
+    @try {
+        for (size_t i = 0; i < kFTC_FeatureCount; i++) {
+            const FTC_Feature *f = &kFTC_Features[i];
+            if (f->kind == FTC_KIND_PATCH && [self.switchOn[@(f->fid)] boolValue]) {
+                FTC_PatchRemoveFeature(f->fid);
+            }
+            if (f->fid == 41 && [self.switchOn[@(41)] boolValue]) {
+                FTC_SetAntiLag(false);
+            }
+            if (f->fid == 7 && [self.switchOn[@(7)] boolValue]) {
+                FTC_ToggleGodMode();
+            }
+            if (f->fid == 33 && [self.switchOn[@(33)] boolValue]) {
+                FTC_ToggleMerchantShelfSlot();
+            }
+            self.switchOn[@(f->fid)] = @(NO);
+            [self setStatus:f->fid text:nil kind:0];
+        }
+        [self setFpsBadgeVisible:NO];
+        if ([self.modeIndex[@(42)] integerValue] != 0) {
+            FTC_SetTimeScale(1.0f);
+            self.modeIndex[@(42)] = @(0);
+            UISegmentedControl *seg = self.segMap[@(42)];
+            if (seg) seg.selectedSegmentIndex = 0;
+        }
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud removeObjectForKey:kPrefSwitches];
+        [ud removeObjectForKey:kPrefQuality];
+        [ud removeObjectForKey:kPrefSpeed];
+        [self buildActiveTabCards];
+        [self updateActiveCountBadge];
+        [self updateTabAppearance];
+    } @catch (...) {}
+}
+
+#pragma mark - Feature Actions (Zero-Lag In-Place Updates)
+
+- (void)onToggleDesc:(UIButton *)sender {
+    int fid = (int)sender.tag;
+    self.descOpen[@(fid)] = @(![self.descOpen[@(fid)] boolValue]);
+    [self refreshCardSubtitle:FTC_FeatureById(fid)];
+}
+
 - (void)onSwitch:(UISwitch *)sender {
     @try {
         int fid = (int)sender.tag;
         BOOL wantOn = sender.isOn;
         const FTC_Feature *f = FTC_FeatureById(fid);
         if (!f) return;
+
         if (f->kind == FTC_KIND_PATCH) {
             FTC_PatchResult r = wantOn ? FTC_PatchApplyFeature(fid)
                                        : FTC_PatchRemoveFeature(fid);
             if (r == FTC_PATCH_OK) {
                 self.switchOn[@(fid)] = @(wantOn);
-                [self setStatus:fid text:(wantOn ? @"Da bat" : @"Da tat")];
+                [self saveSwitchState:fid on:wantOn];
+                [self setStatus:fid text:(wantOn ? @"Da bat" : @"Da tat") kind:1];
                 if (fid == 10 && wantOn) {
-                    // Fill the fever bar once when enabling (patch only
-                    // stops expiry; it does not fill).
                     FTC_CallResult cr = FTC_FillFever();
                     if (cr != FTC_CALL_OK) {
                         [self setStatus:fid text:[NSString stringWithFormat:@"Patch bat; %@",
-                                                  [self messageForCall:cr]]];
+                                                  [self messageForCall:cr]] kind:1];
                     }
                 }
             } else {
-                sender.on = !wantOn; // refuse: leave the switch where it was
-                [self setStatus:fid text:[NSString stringWithUTF8String:FTC_PatchResultMessage(r)]];
+                sender.on = !wantOn;
+                [self setStatus:fid text:[NSString stringWithUTF8String:FTC_PatchResultMessage(r)] kind:2];
             }
         } else { // DEV_TOGGLE
+            if (fid == 40) {
+                self.switchOn[@(40)] = @(wantOn);
+                [self saveSwitchState:40 on:wantOn];
+                [self setStatus:40 text:(wantOn ? @"Da bat (goc trai day)" : @"Da tat") kind:1];
+                [self setFpsBadgeVisible:wantOn];
+                [self updateCardInPlace:40];
+                return;
+            }
             FTC_CallResult cr = FTC_CALL_ERR_UNAVAILABLE;
             if (fid == 7) cr = FTC_ToggleGodMode();
             else if (fid == 33) cr = FTC_ToggleMerchantShelfSlot();
-            else if (fid == 40) cr = FTC_ToggleFps();
+            else if (fid == 41) cr = FTC_SetAntiLag(wantOn);
             if (cr == FTC_CALL_OK) {
                 self.switchOn[@(fid)] = @(wantOn);
-                [self setStatus:fid text:(wantOn ? @"Da bat" : @"Da tat")];
-                if (fid == 40) [self setFpsBadgeVisible:wantOn];
+                [self saveSwitchState:fid on:wantOn];
+                [self setStatus:fid text:(wantOn ? @"Da bat" : @"Da tat") kind:1];
             } else {
                 sender.on = !wantOn;
-                [self setStatus:fid text:[self messageForCall:cr]];
+                [self setStatus:fid text:[self messageForCall:cr] kind:2];
             }
         }
-        [self rebuildContent];
+        [self updateCardInPlace:fid];
     } @catch (...) {}
 }
 
 - (void)onOneshot:(UIButton *)sender {
     @try {
         int fid = (int)sender.tag;
-        if (fid == 27) { // ResetRun destroys the current run — confirm first.
+        if (fid == 27) {
             UIViewController *root = [self topViewController];
             if (!root) {
-                [self setStatus:27 text:@"Khong hien duoc hop thoai xac nhan"];
-                [self rebuildContent];
+                [self setStatus:27 text:@"Khong hien duoc hop thoai xac nhan" kind:2];
+                [self updateCardInPlace:27];
                 return;
             }
             UIAlertController *alert = [UIAlertController
@@ -951,9 +1354,10 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
             case 31: cr = FTC_OpenArmory(); break;
             default: break;
         }
-        [self setStatus:fid text:(cr == FTC_CALL_OK) ? @"Da chay"
-                                                     : [self messageForCall:cr]];
-        [self rebuildContent];
+        [self setStatus:fid
+                   text:(cr == FTC_CALL_OK) ? @"Da chay thanh cong" : [self messageForCall:cr]
+                   kind:(cr == FTC_CALL_OK) ? 1 : 2];
+        [self updateCardInPlace:fid];
     } @catch (...) {}
 }
 
@@ -962,45 +1366,60 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         int fid = (int)sender.tag;
         FTC_CallResult cr = FTC_CALL_ERR_UNAVAILABLE;
         if (fid == 4) {
-            // CycleForgeMode rotates the dev forge mode. NOTE: while the #4
-            // Guard patch is ON, this has no effect on Guard (always
-            // AlwaysSuccess) — see FeatureCatalog.h #4.
             cr = FTC_CycleForgeMode();
             if (cr == FTC_CALL_OK && [self.switchOn[@(4)] boolValue]) {
-                [self setStatus:4 text:@"Da goi Doi mode (patch Ren luon thanh cong dang BAT nen Guard van luon AlwaysSuccess)"];
-                [self rebuildContent];
+                [self setStatus:4 text:@"Da doi mode (patch #4 dang BAT -> luon AlwaysSuccess)" kind:1];
+                [self updateCardInPlace:4];
                 return;
             }
         }
         else if (fid == 7) cr = FTC_KillDragon();
         else if (fid == 24) cr = FTC_OpenSwordPicker();
-        [self setStatus:fid text:(cr == FTC_CALL_OK) ? @"Da chay"
-                                                     : [self messageForCall:cr]];
-        [self rebuildContent];
+        [self setStatus:fid
+                   text:(cr == FTC_CALL_OK) ? @"Da chay thanh cong" : [self messageForCall:cr]
+                   kind:(cr == FTC_CALL_OK) ? 1 : 2];
+        [self updateCardInPlace:fid];
     } @catch (...) {}
 }
 
 - (void)onSegment:(UISegmentedControl *)sender {
     @try {
         int fid = (int)sender.tag;
+        NSInteger idx = sender.selectedSegmentIndex;
         if (fid == 28) {
-            // Each tap is one call: -1 = SkipDay, +1 = NextDay.
-            FTC_CallResult cr = (sender.selectedSegmentIndex == 0) ? FTC_SkipDay() : FTC_NextDay();
-            [self setStatus:fid text:(cr == FTC_CALL_OK) ? @"Da chay"
-                                                         : [self messageForCall:cr]];
-            [self rebuildContent];
+            FTC_CallResult cr = (idx == 0) ? FTC_SkipDay() : FTC_NextDay();
+            [self setStatus:fid
+                       text:(cr == FTC_CALL_OK) ? (idx == 0 ? @"Da lui 1 ngay" : @"Da tien 1 ngay")
+                                                : [self messageForCall:cr]
+                       kind:(cr == FTC_CALL_OK) ? 1 : 2];
+            [self updateCardInPlace:fid];
             return;
         }
         if (fid == 32) {
-            // Thap=0, Vua=1, Cao=2.
-            FTC_CallResult cr = FTC_SetQualityTier((int)sender.selectedSegmentIndex);
+            FTC_CallResult cr = FTC_SetQualityTier((int)idx);
             if (cr == FTC_CALL_OK) {
-                self.modeIndex[@(fid)] = @(sender.selectedSegmentIndex);
-                [self setStatus:fid text:@"Da doi"];
+                self.modeIndex[@(32)] = @(idx);
+                [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kPrefQuality];
+                [self setStatus:32 text:@"Da doi do hoa" kind:1];
             } else {
-                [self setStatus:fid text:[self messageForCall:cr]];
+                [self setStatus:32 text:[self messageForCall:cr] kind:2];
             }
-            [self rebuildContent];
+            [self updateCardInPlace:32];
+            return;
+        }
+        if (fid == 42) {
+            if (idx < 0 || idx > 3) idx = 0;
+            FTC_CallResult cr = FTC_SetTimeScale(kSpeedValues[idx]);
+            if (cr == FTC_CALL_OK) {
+                self.modeIndex[@(42)] = @(idx);
+                [[NSUserDefaults standardUserDefaults] setInteger:idx forKey:kPrefSpeed];
+                [self setStatus:42
+                           text:[NSString stringWithFormat:@"Toc do %.1fx", kSpeedValues[idx]]
+                           kind:1];
+            } else {
+                [self setStatus:42 text:[self messageForCall:cr] kind:2];
+            }
+            [self updateCardInPlace:42];
         }
     } @catch (...) {}
 }
@@ -1011,12 +1430,12 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 
 - (void)onTicketPlus:(UIButton *)sender {
     @try {
-        // ForgeOutcome: Damage=1, Hold=2, Success=3, GreatSuccess=4.
         int outcome = (int)[self.modeIndex[@(12)] integerValue] + 1;
         FTC_CallResult cr = FTC_AddRunTickets(outcome, 1);
-        [self setStatus:12 text:(cr == FTC_CALL_OK) ? @"Da cong 1 ve"
-                                                    : [self messageForCall:cr]];
-        [self rebuildContent];
+        [self setStatus:12
+                   text:(cr == FTC_CALL_OK) ? @"Da cong +1 ve" : [self messageForCall:cr]
+                   kind:(cr == FTC_CALL_OK) ? 1 : 2];
+        [self updateCardInPlace:12];
     } @catch (...) {}
 }
 
@@ -1025,10 +1444,8 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         NSInteger fid = sender.tag;
         NSInteger v = (NSInteger)sender.value;
         self.stepValue[@(fid)] = @(v);
-        UILabel *val = (UILabel *)[sender.superview viewWithTag:(9000 + fid)];
-        if (val) {
-            val.text = [NSString stringWithFormat:@"%ld", (long)v];
-        }
+        UILabel *val = self.stepValMap[@(fid)];
+        if (val) val.text = [NSString stringWithFormat:@"%ld", (long)v];
     } @catch (...) {}
 }
 
@@ -1039,34 +1456,36 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
         FTC_CallResult cr = FTC_CALL_ERR_UNAVAILABLE;
         if (fid == 6) cr = FTC_SetAnvilGrade((int)v);
         else if (fid == 9) cr = FTC_JumpToDay((int)v);
-        if (cr == FTC_CALL_OK) {
-            [self setStatus:fid text:@"Da chay"];
-            if (fid == 9) {
-                self.currentDay = v;
-                self.dayPillValue.text = [NSString stringWithFormat:@"Ngay %ld", (long)v];
-            }
-        } else {
-            [self setStatus:fid text:[self messageForCall:cr]];
-        }
-        [self rebuildContent];
+        [self setStatus:fid
+                   text:(cr == FTC_CALL_OK) ? [NSString stringWithFormat:@"Da ap dung (%ld)", (long)v]
+                                            : [self messageForCall:cr]
+                   kind:(cr == FTC_CALL_OK) ? 1 : 2];
+        [self updateCardInPlace:fid];
     } @catch (...) {}
 }
 
-#pragma mark - FPS badge (CADisplayLink only while #40 is ON)
+#pragma mark - FPS Badge (Fixed Bottom-Left, Ultra-Lightweight)
 
 - (void)setFpsBadgeVisible:(BOOL)visible {
     @try {
+        [self layoutFpsBadge];
         self.fpsBadge.hidden = !visible;
         if (visible) {
             [self stopFpsLink];
             self.fpsFrames = 0;
-            self.fpsLastUpdate = CACurrentMediaTime();
+            self.fpsLastUpdate = 0;
+            self.lastDisplayedFps = -1;
+            self.fpsBadge.text = @"-- FPS";
             CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self
                                                                selector:@selector(onFpsTick:)];
+            if (@available(iOS 15.0, *)) {
+                link.preferredFrameRateRange = CAFrameRateRangeMake(60, 120, 120);
+            }
             [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
             self.fpsLink = link;
         } else {
             [self stopFpsLink];
+            self.lastDisplayedFps = -1;
             self.fpsBadge.text = @"-- FPS";
         }
     } @catch (...) {}
@@ -1078,11 +1497,20 @@ static const size_t kCategoryCount = sizeof(kCategories) / sizeof(kCategories[0]
 }
 
 - (void)onFpsTick:(CADisplayLink *)link {
+    CFTimeInterval now = link.timestamp;
+    if (self.fpsLastUpdate == 0) {
+        self.fpsLastUpdate = now;
+        self.fpsFrames = 0;
+        return;
+    }
     self.fpsFrames++;
-    NSTimeInterval now = CACurrentMediaTime();
-    if (now - self.fpsLastUpdate >= 1.0) {
-        NSInteger fps = (NSInteger)lround(self.fpsFrames / (now - self.fpsLastUpdate));
-        self.fpsBadge.text = [NSString stringWithFormat:@"%ld FPS", (long)fps];
+    CFTimeInterval elapsed = now - self.fpsLastUpdate;
+    if (elapsed >= 1.0) {
+        NSInteger fps = (NSInteger)lround(self.fpsFrames / elapsed);
+        if (fps != self.lastDisplayedFps) {
+            self.lastDisplayedFps = fps;
+            self.fpsBadge.text = [NSString stringWithFormat:@"%ld FPS", (long)fps];
+        }
         self.fpsFrames = 0;
         self.fpsLastUpdate = now;
     }

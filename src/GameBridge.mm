@@ -368,6 +368,86 @@ FTC_CallResult FTC_OpenArmory(void) { return InvokeTools0("OpenArmory"); }
 FTC_CallResult FTC_ToggleMerchantShelfSlot(void) { return InvokeTools0("ToggleMerchantShelfSlot"); }
 FTC_CallResult FTC_ToggleFps(void) { return InvokeTools0("ToggleFps"); }
 
+FTC_CallResult FTC_SetAntiLag(bool enabled) {
+    // Extreme Max-FPS / Anti-Lag boost via pure static IL2CPP calls (no __TEXT
+    // patch, works natively on TrollStore without JIT):
+    //   - Application.set_targetFrameRate(120) -> unlocks 120 FPS on ProMotion
+    //     and prevents Unity from throttling down to 30 FPS on 60 Hz iPhone 7 Plus.
+    //   - QualitySettings: vSyncCount=0, antiAliasing=0 (MSAA off),
+    //     globalTextureMipmapLimit=1 (cuts 3D texture bandwidth ~75%),
+    //     enableLODCrossFade=false.
+    //   - ScalableBufferManager.ResizeBuffers(0.8, 0.8) -> lighter GPU fillrate.
+    //   - ForgeQualityTier.Force(Low) -> lowers game's own FX/shader tier
+    //     (restored to Auto/null when disabled).
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+
+    bool anyOk = false;
+    Il2CppClass *appClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Application");
+    if (appClass) {
+        int32_t fps = enabled ? 120 : 60;
+        void *args[1] = { &fps };
+        if (InvokeBool(appClass, NULL, "set_targetFrameRate", 1, args) == FTC_CALL_OK) {
+            anyOk = true;
+        }
+    }
+    Il2CppClass *qsClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "QualitySettings");
+    if (qsClass) {
+        int32_t vsync = enabled ? 0 : 1;
+        void *vsArgs[1] = { &vsync };
+        if (InvokeBool(qsClass, NULL, "set_vSyncCount", 1, vsArgs) == FTC_CALL_OK) {
+            anyOk = true;
+        }
+        int32_t aa = enabled ? 0 : 2;
+        void *aaArgs[1] = { &aa };
+        if (InvokeBool(qsClass, NULL, "set_antiAliasing", 1, aaArgs) == FTC_CALL_OK) {
+            anyOk = true;
+        }
+        int32_t mip = enabled ? 1 : 0;
+        void *mipArgs[1] = { &mip };
+        InvokeBool(qsClass, NULL, "set_globalTextureMipmapLimit", 1, mipArgs);
+
+        uint8_t lodFade = enabled ? 0 : 1;
+        void *lodArgs[1] = { &lodFade };
+        InvokeBool(qsClass, NULL, "set_enableLODCrossFade", 1, lodArgs);
+    }
+    Il2CppClass *sbmClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "ScalableBufferManager");
+    if (sbmClass) {
+        float scale = enabled ? 0.80f : 1.0f;
+        void *sArgs[2] = { &scale, &scale };
+        InvokeBool(sbmClass, NULL, "ResizeBuffers", 2, sArgs);
+    }
+    Il2CppClass *qtClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Quality", "ForgeQualityTier");
+    if (qtClass) {
+        struct {
+            uint8_t hasValue;
+            uint8_t pad[3];
+            int32_t value;
+        } nullable;
+        nullable.hasValue = enabled ? 1 : 0;
+        nullable.pad[0] = nullable.pad[1] = nullable.pad[2] = 0;
+        nullable.value = 0; // Low
+        void *qArgs[1] = { &nullable };
+        if (InvokeBool(qtClass, NULL, "Force", 1, qArgs) == FTC_CALL_OK) {
+            anyOk = true;
+        }
+    }
+    return anyOk ? FTC_CALL_OK : FTC_CALL_ERR_NO_METHOD;
+}
+
+FTC_CallResult FTC_SetTimeScale(float scale) {
+    // Pure static UnityEngine.Time.set_timeScale(float) — works natively on
+    // TrollStore without JIT. Clamped to [0.5, 4.0] for stability.
+    if (scale < 0.5f) scale = 0.5f;
+    if (scale > 4.0f) scale = 4.0f;
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppClass *timeClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Time");
+    if (!timeClass) return FTC_CALL_ERR_NO_METHOD;
+    void *args[1] = { &scale };
+    return InvokeBool(timeClass, NULL, "set_timeScale", 1, args);
+}
+
 FTC_CallResult FTC_SetQualityTier(int tier) {
     // SetQualityTier(Nullable<QualityTier>) — QualityTier: Low=0, Mid=1, High=2.
     // Verified from global-metadata.dat (mscorlib.dll System.Nullable`1) AND
@@ -375,8 +455,6 @@ FTC_CallResult FTC_SetQualityTier(int tier) {
     // field 0 = hasValue (bool at +0), field 1 = value (int32 at +4).
     if (tier < 0) tier = 0;
     if (tier > 2) tier = 2;
-    Il2CppObject *tools = ResolveTools();
-    if (!tools) return FTC_CALL_ERR_NO_INSTANCE;
     struct {
         uint8_t hasValue;
         uint8_t pad[3];
@@ -386,7 +464,15 @@ FTC_CallResult FTC_SetQualityTier(int tier) {
     nullable.pad[0] = nullable.pad[1] = nullable.pad[2] = 0;
     nullable.value = (int32_t)tier;
     void *args[1] = { &nullable };
-    return InvokeBool(ToolsClass(), tools, "SetQualityTier", 1, args);
+    Il2CppObject *tools = ResolveTools();
+    if (tools) {
+        FTC_CallResult cr = InvokeBool(ToolsClass(), tools, "SetQualityTier", 1, args);
+        if (cr == FTC_CALL_OK) return cr;
+    }
+    // Static fallback so #32 works on any screen (even before ForgeRoom loads).
+    Il2CppClass *qtClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Quality", "ForgeQualityTier");
+    if (!qtClass) return tools ? FTC_CALL_ERR_NO_METHOD : FTC_CALL_ERR_NO_INSTANCE;
+    return InvokeBool(qtClass, NULL, "Force", 1, args);
 }
 
 FTC_CallResult FTC_AddRunTickets(int outcome, int count) {

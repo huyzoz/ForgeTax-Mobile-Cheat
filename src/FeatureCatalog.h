@@ -194,10 +194,17 @@ static const FTC_Feature kFTC_Features[] = {
       "SetQualityTier(Nullable<QualityTier>): Thap=0, Vua=1, Cao=2. "
       "Layout Nullable la struct {int32 value; bool has_value} — chua kiem chung live." },
     { 40, "setting", "Hien FPS",
-      "Hien khung FPS that dinh lien logo, o goc trai man hinh tren cung.",
+      "Hien khung FPS co dinh o goc trai day man hinh (khong di chuyen theo logo).",
       FTC_KIND_DEV_TOGGLE,
-      "Gat = ToggleFps() 1 lan (dong ho FPS cua dev tool) + bat/tat CADisplayLink "
-      "cua rieng menu (chi ton tai khi bat; 1 giay cap nhat label 1 lan)." },
+      "CADisplayLink sieu nhe cua menu, co dinh goc trai day, chi cap nhat khi so FPS doi." },
+    { 41, "setting", "Boost Max FPS (120 FPS + Xoa lag)",
+      "Mo khoa 120 FPS (toi da theo tan so man hinh), tat AA/vSync, ha mipmap + scale 80% + Quality Low de chay muot nhat.",
+      FTC_KIND_DEV_TOGGLE,
+      "Goi static UnityEngine (targetFrameRate=120, vSync=0, antiAliasing=0, mipmapLimit=1, ResizeBuffers=0.8) + ForgeQualityTier.Force(Low)." },
+    { 42, "setting", "Toc do game (Speed Hack)",
+      "Tang toc do ren, dap bua va hoat anh len 1x / 1.5x / 2x / 3x (chay thang khong can JIT).",
+      FTC_KIND_MODE,
+      "Goi static UnityEngine.Time.set_timeScale(1.0 / 1.5 / 2.0 / 3.0)." },
 };
 static const size_t kFTC_FeatureCount = sizeof(kFTC_Features) / sizeof(kFTC_Features[0]);
 

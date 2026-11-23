@@ -77,6 +77,10 @@ FTC_CallResult FTC_OpenArmory(void);                  // #31
 FTC_CallResult FTC_SetQualityTier(int tier);          // #32: 0 Thap, 1 Vua, 2 Cao
 FTC_CallResult FTC_ToggleMerchantShelfSlot(void);     // #33 (flip, credit-shelf)
 FTC_CallResult FTC_ToggleFps(void);                   // #40 (flip)
+// #41: Anti-lag boost (Unity QualitySettings.antiAliasing=0 + targetFrameRate=120).
+FTC_CallResult FTC_SetAntiLag(bool enabled);
+// #42: Speed Hack via UnityEngine.Time.set_timeScale(float).
+FTC_CallResult FTC_SetTimeScale(float scale);
 // #12: outcome = ForgeOutcome: 1 Damage, 2 Hold, 3 Success, 4 GreatSuccess.
 FTC_CallResult FTC_AddRunTickets(int outcome, int count);
 
