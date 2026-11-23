@@ -11,6 +11,10 @@ DerivedData/
 __pycache__/
 *.pyc
 
+# Secrets / local tokens (NEVER commit)
+token push.txt
+*token*.txt
+
 # macOS / editors
 .DS_Store
 *.swp

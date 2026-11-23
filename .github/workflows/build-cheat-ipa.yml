@@ -99,13 +99,35 @@ jobs:
           shasum -a 256 ForgeTax-Cheat-3.16.1.ipa | tee ForgeTax-Cheat-3.16.1.ipa.sha256
           ls -la ForgeTax-Cheat-3.16.1.ipa
 
-      - name: Fake-sign with ldid (best effort)
+      - name: Fake-sign with ldid (TrollStore entitlements + best effort)
         run: |
           brew install ldid || true
           if command -v ldid >/dev/null; then
-            ldid -S "work/$APP" || echo "::warning::ldid failed on the .app — IPA still uploaded, sign it manually if TrollStore refuses it."
+            EXE_NAME=$(basename "$APP" .app)
+            cat > /tmp/trollstore-entitlements.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.developer.team-identifier</key>
+            <string>8C44S5HXT5</string>
+            <key>application-identifier</key>
+            <string>8C44S5HXT5.com.soucean.fruityzoo</string>
+            <key>get-task-allow</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+            ldid -S/tmp/trollstore-entitlements.plist "work/$APP/$EXE_NAME" || echo "::warning::ldid failed on the main executable — IPA still uploaded."
             ldid -S "work/$APP/Frameworks/ForgeTaxCheat.dylib" || echo "::warning::ldid failed on the dylib."
-            # Re-pack after signing (signing rewrites files in place).
+            # Assert UnityFramework was NOT touched by ldid.
+            shasum -a 256 "work/$APP/Frameworks/UnityFramework.framework/UnityFramework" | awk '{print $1}' | tee unity-after-ldid.txt
+            diff unity-before.txt unity-after-ldid.txt || {
+              echo "::error::UnityFramework changed during ldid — refusing to ship."
+              exit 1
+            }
+            # Re-pack cleanly after signing (signing rewrites files in place).
+            rm -f ForgeTax-Cheat-3.16.1.ipa
             cd work
             zip -r -y ../ForgeTax-Cheat-3.16.1.ipa Payload >/dev/null
             cd ..
@@ -114,23 +136,25 @@ jobs:
             echo "::warning::ldid not available — IPA uploaded unsigned (TrollStore install may still work)."
           fi
 
-      - name: Assert LC_LOAD_DYLIB present in final IPA
+      - name: Assert LC_LOAD_DYLIB and dylib present in final IPA
         # Independent check that the cheat actually loads: read the main
         # executable out of the FINAL repacked IPA (after ldid re-pack)
         # and fail if it has no load command for ForgeTaxCheat.dylib.
-        # (AEGIS fix: the workflow previously asserted only the
-        # UnityFramework SHA, so a silent inject failure would still
-        # upload an IPA without the cheat.)
         run: |
           rm -rf /tmp/final-ipa-check && mkdir -p /tmp/final-ipa-check
           unzip -q ForgeTax-Cheat-3.16.1.ipa -d /tmp/final-ipa-check
           EXE="/tmp/final-ipa-check/$APP/$(basename "$APP" .app)"
+          DYLIB="/tmp/final-ipa-check/$APP/Frameworks/ForgeTaxCheat.dylib"
+          if [ ! -f "$DYLIB" ]; then
+            echo "::error::Final IPA is missing $DYLIB"
+            exit 1
+          fi
           if ! otool -l "$EXE" | grep -q "@executable_path/Frameworks/ForgeTaxCheat.dylib"; then
             echo "::error::Final IPA has no LC_LOAD_DYLIB for @executable_path/Frameworks/ForgeTaxCheat.dylib in $EXE"
             otool -l "$EXE" | grep -i "dylib" || true
             exit 1
           fi
-          echo "LC_LOAD_DYLIB @executable_path/Frameworks/ForgeTaxCheat.dylib present in final IPA."
+          echo "LC_LOAD_DYLIB and Frameworks/ForgeTaxCheat.dylib present in final IPA."
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

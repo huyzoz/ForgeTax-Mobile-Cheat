@@ -4,9 +4,10 @@
 // wrapped in try/catch and null-checked; a failure returns an error code
 // and the menu shows "chua goi duoc" — results are never faked.
 //
-// il2cpp function pointers are resolved with dlsym(RTLD_DEFAULT) at first
-// use; if the runtime symbols are not exported, the bridge reports
-// UNAVAILABLE instead of crashing.
+// il2cpp function pointers are resolved with dlsym(RTLD_DEFAULT) lazily;
+// because the thin iOS launcher loads UnityFramework dynamically, lookup
+// retries until UnityFramework's exports are present instead of latching
+// a permanent failure.
 #import "GameBridge.h"
 
 #include <dlfcn.h>
@@ -23,10 +24,11 @@ typedef struct Il2CppMethod Il2CppMethod;
 typedef struct Il2CppField Il2CppField;
 typedef struct Il2CppObject Il2CppObject;
 typedef struct Il2CppType Il2CppType;
-typedef struct Il2CppException Il2CppException;
+typedef struct Il2CppThread Il2CppThread;
 
 typedef Il2CppDomain *(*FNDomainGet)(void);
-typedef void (*FNThreadAttach)(Il2CppDomain *);
+typedef Il2CppThread *(*FNThreadCurrent)(void);
+typedef Il2CppThread *(*FNThreadAttach)(Il2CppDomain *);
 typedef Il2CppAssembly **(*FNDomainGetAssemblies)(Il2CppDomain *, size_t *);
 typedef Il2CppImage *(*FNAssemblyGetImage)(Il2CppAssembly *);
 typedef const char *(*FNImageGetName)(Il2CppImage *);
@@ -39,9 +41,11 @@ typedef Il2CppObject *(*FNTypeGetObject)(const Il2CppType *);
 typedef Il2CppObject *(*FNRuntimeInvoke)(Il2CppMethod *, Il2CppObject *, void **, Il2CppObject **);
 typedef void *(*FNObjectUnbox)(Il2CppObject *);
 typedef Il2CppObject *(*FNObjectNew)(Il2CppClass *);
+typedef Il2CppClass *(*FNObjectGetClass)(Il2CppObject *);
 
 typedef struct {
     FNDomainGet domainGet;
+    FNThreadCurrent threadCurrent;
     FNThreadAttach threadAttach;
     FNDomainGetAssemblies domainGetAssemblies;
     FNAssemblyGetImage assemblyGetImage;
@@ -55,15 +59,18 @@ typedef struct {
     FNRuntimeInvoke runtimeInvoke;
     FNObjectUnbox objectUnbox;
     FNObjectNew objectNew;
+    FNObjectGetClass objectGetClass;
     int loaded; // 1 = all required symbols resolved
 } Il2CppApi;
 
 static Il2CppApi s_api;
-static pthread_once_t s_apiOnce = PTHREAD_ONCE_INIT;
+static pthread_mutex_t s_apiMutex = PTHREAD_MUTEX_INITIALIZER;
 
-static void LoadApi(void) {
+static void TryLoadApiLocked(void) {
+    if (s_api.loaded) return;
     memset(&s_api, 0, sizeof(s_api));
     s_api.domainGet = (FNDomainGet)dlsym(RTLD_DEFAULT, "il2cpp_domain_get");
+    s_api.threadCurrent = (FNThreadCurrent)dlsym(RTLD_DEFAULT, "il2cpp_thread_current");
     s_api.threadAttach = (FNThreadAttach)dlsym(RTLD_DEFAULT, "il2cpp_thread_attach");
     s_api.domainGetAssemblies = (FNDomainGetAssemblies)dlsym(RTLD_DEFAULT, "il2cpp_domain_get_assemblies");
     s_api.assemblyGetImage = (FNAssemblyGetImage)dlsym(RTLD_DEFAULT, "il2cpp_assembly_get_image");
@@ -77,21 +84,27 @@ static void LoadApi(void) {
     s_api.runtimeInvoke = (FNRuntimeInvoke)dlsym(RTLD_DEFAULT, "il2cpp_runtime_invoke");
     s_api.objectUnbox = (FNObjectUnbox)dlsym(RTLD_DEFAULT, "il2cpp_object_unbox");
     s_api.objectNew = (FNObjectNew)dlsym(RTLD_DEFAULT, "il2cpp_object_new");
-    // object_unbox / object_new are optional niceties; the rest are required.
+    s_api.objectGetClass = (FNObjectGetClass)dlsym(RTLD_DEFAULT, "il2cpp_object_get_class");
+    // object_unbox / object_new / object_get_class / thread_current are optional;
+    // the rest are required.
     s_api.loaded = (s_api.domainGet && s_api.threadAttach && s_api.domainGetAssemblies &&
                     s_api.assemblyGetImage && s_api.imageGetName && s_api.classFromName &&
                     s_api.classGetMethod && s_api.classGetField && s_api.fieldGetValue &&
                     s_api.classGetType && s_api.typeGetObject && s_api.runtimeInvoke) ? 1 : 0;
-    if (s_api.loaded) {
-        Il2CppDomain *domain = s_api.domainGet();
-        if (domain) {
-            @try { s_api.threadAttach(domain); } @catch (...) {}
-        }
-    }
 }
 
 static Il2CppApi *Api(void) {
-    pthread_once(&s_apiOnce, LoadApi);
+    if (!s_api.loaded) {
+        pthread_mutex_lock(&s_apiMutex);
+        TryLoadApiLocked();
+        pthread_mutex_unlock(&s_apiMutex);
+    }
+    if (s_api.loaded) {
+        Il2CppDomain *domain = s_api.domainGet();
+        if (domain && (!s_api.threadCurrent || s_api.threadCurrent() == NULL)) {
+            @try { s_api.threadAttach(domain); } @catch (...) {}
+        }
+    }
     return &s_api;
 }
 
@@ -99,7 +112,7 @@ const char *FTC_CallResultMessage(FTC_CallResult r) {
     switch (r) {
         case FTC_CALL_OK: return "OK";
         case FTC_CALL_ERR_UNAVAILABLE: return "Chua goi duoc: IL2CPP runtime chua san sang";
-        case FTC_CALL_ERR_NO_INSTANCE: return "Chua goi duoc: chua tim thay dev tools trong game (thu mo menu tam dung trong game roi bam lai)";
+        case FTC_CALL_ERR_NO_INSTANCE: return "Chua goi duoc: chua tim thay dev tools trong game (thu vao man choi hoac mo menu tam dung roi bam lai)";
         case FTC_CALL_ERR_NO_METHOD: return "Chua goi duoc: khong tim thay ham trong game";
         case FTC_CALL_ERR_EXCEPTION: return "Game bao loi khi chay lenh";
         case FTC_CALL_ERR_RETURNED_FALSE: return "Game tu choi lenh (chua du dieu kien trong game)";
@@ -108,9 +121,26 @@ const char *FTC_CallResultMessage(FTC_CallResult r) {
 }
 
 // ---- Image / class lookup ----
+// il2cpp_image_get_name returns names WITH the ".dll" extension in Unity 6
+// (e.g. "Assembly-CSharp.dll", "UnityEngine.CoreModule.dll", "ForgeTax.Rules.dll").
+// Match both with and without ".dll" so callers never miss on suffix mismatch.
+static bool ImageNameMatches(const char *actual, const char *wanted) {
+    if (!actual || !wanted) return false;
+    if (strcmp(actual, wanted) == 0) return true;
+    size_t alen = strlen(actual);
+    size_t wlen = strlen(wanted);
+    if (alen == wlen + 4 && strncmp(actual, wanted, wlen) == 0 && strcmp(actual + wlen, ".dll") == 0) {
+        return true;
+    }
+    if (wlen == alen + 4 && strncmp(wanted, actual, alen) == 0 && strcmp(wanted + alen, ".dll") == 0) {
+        return true;
+    }
+    return false;
+}
+
 static Il2CppImage *FindImage(const char *imageName) {
     Il2CppApi *api = Api();
-    if (!api->loaded) return NULL;
+    if (!api->loaded || !imageName) return NULL;
     Il2CppDomain *domain = api->domainGet();
     if (!domain) return NULL;
     size_t count = 0;
@@ -120,19 +150,39 @@ static Il2CppImage *FindImage(const char *imageName) {
         Il2CppImage *image = api->assemblyGetImage(assemblies[i]);
         if (!image) continue;
         const char *name = api->imageGetName(image);
-        if (name && strcmp(name, imageName) == 0) return image;
+        if (ImageNameMatches(name, imageName)) return image;
     }
     return NULL;
 }
 
 static Il2CppClass *FindClass(const char *imageName, const char *ns, const char *name) {
-    Il2CppImage *image = FindImage(imageName);
-    if (!image) return NULL;
-    return Api()->classFromName(image, ns, name);
+    Il2CppApi *api = Api();
+    if (!api->loaded || !name) return NULL;
+    if (!ns) ns = "";
+    if (imageName) {
+        Il2CppImage *image = FindImage(imageName);
+        if (image) {
+            Il2CppClass *klass = api->classFromName(image, ns, name);
+            if (klass) return klass;
+        }
+    }
+    // Fallback: scan all loaded assemblies (handles split asmdefs like ForgeTax.Rules.dll).
+    Il2CppDomain *domain = api->domainGet();
+    if (!domain) return NULL;
+    size_t count = 0;
+    Il2CppAssembly **assemblies = api->domainGetAssemblies(domain, &count);
+    if (!assemblies) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        Il2CppImage *image = api->assemblyGetImage(assemblies[i]);
+        if (!image) continue;
+        Il2CppClass *klass = api->classFromName(image, ns, name);
+        if (klass) return klass;
+    }
+    return NULL;
 }
 
 static Il2CppObject *ReadObjectField(Il2CppObject *obj, Il2CppClass *klass, const char *fieldName) {
-    if (!obj || !klass) return NULL;
+    if (!obj || !klass || !fieldName) return NULL;
     Il2CppField *field = Api()->classGetField(klass, fieldName);
     if (!field) return NULL;
     Il2CppObject *value = NULL;
@@ -144,26 +194,28 @@ static Il2CppObject *ReadObjectField(Il2CppObject *obj, Il2CppClass *klass, cons
 // Primary: ForgePauseMenu (MonoBehaviour) -> developerPage -> tools.
 // Fallback: ForgeRoom (MonoBehaviour) -> new ForgeDeveloperTools(room).
 //
-// NO CACHING (AEGIS fix): earlier versions kept s_toolsCache /
-// s_campaignCache forever after the first resolve. If the game destroys
-// and recreates the pause menu / room / campaign (scene reload, run
-// reset), a cached Il2CppObject* becomes a dangling pointer and the next
-// runtime_invoke on it can crash instead of reporting NO_INSTANCE.
-// So ResolveTools()/ResolveCampaign() re-resolve FRESH on every call and
-// never store the result. These calls only happen when the user taps a
-// menu button (never per-frame), so the extra FindObjectOfType cost is
-// negligible. No code path may hold an Il2CppObject* across calls.
+// NO CACHING (AEGIS fix): ResolveTools()/ResolveCampaign() re-resolve FRESH
+// on every call and never store an Il2CppObject* across calls, so a scene
+// reload or run reset can never leave a dangling pointer.
 static Il2CppObject *FindUnityObject(Il2CppClass *klass) {
-    // UnityEngine.Object.FindObjectOfType(Type, bool includeInactive)
+    if (!klass) return NULL;
+    // UnityEngine.Object.FindObjectOfType(Type type, bool includeInactive)
     Il2CppApi *api = Api();
-    Il2CppClass *objectClass = FindClass("UnityEngine.CoreModule", "UnityEngine", "Object");
+    if (!api->loaded) return NULL;
+    Il2CppClass *objectClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Object");
     if (!objectClass) return NULL;
     Il2CppMethod *find = api->classGetMethod(objectClass, "FindObjectOfType", 2);
     if (!find) return NULL;
-    Il2CppObject *typeObj = api->typeGetObject(api->classGetType(klass));
+    const Il2CppType *rawType = api->classGetType(klass);
+    if (!rawType) return NULL;
+    Il2CppObject *typeObj = api->typeGetObject(rawType);
     if (!typeObj) return NULL;
-    bool includeInactive = false;
-    void *args[2] = { &typeObj, &includeInactive };
+    // includeInactive = true so inactive menus/components are still found.
+    // IMPORTANT: in IL2CPP runtime_invoke, reference-type args (System.Type)
+    // are passed directly as the Il2CppObject* pointer, while value-type args
+    // (bool) are passed by address (&includeInactive).
+    uint8_t includeInactive = 1;
+    void *args[2] = { typeObj, &includeInactive };
     Il2CppObject *exc = NULL;
     Il2CppObject *found = NULL;
     @try {
@@ -180,8 +232,8 @@ static Il2CppObject *ResolveTools(void) {
     if (!api->loaded) return NULL;
 
     // Path 1: pause menu chain.
-    Il2CppClass *pauseClass = FindClass("Assembly-CSharp", "ForgeTax.Menu", "ForgePauseMenu");
-    Il2CppClass *pageClass = FindClass("Assembly-CSharp", "ForgeTax.Touch", "ForgeDeveloperPage");
+    Il2CppClass *pauseClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Menu", "ForgePauseMenu");
+    Il2CppClass *pageClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperPage");
     if (pauseClass && pageClass) {
         Il2CppObject *pause = FindUnityObject(pauseClass);
         if (pause) {
@@ -193,11 +245,9 @@ static Il2CppObject *ResolveTools(void) {
         }
     }
     // Path 2: build a tools instance from the live ForgeRoom.
-    // (ForgeDeveloperTools.ctor(ForgeRoom) — dump.cs RVA 0x263C4E8.)
-    // NOTE: unproven live — the dev page may be the only intended owner.
-    // If construction fails, we report NO_INSTANCE; nothing is faked.
-    Il2CppClass *toolsClass = FindClass("Assembly-CSharp", "ForgeTax.Touch", "ForgeDeveloperTools");
-    Il2CppClass *roomClass = FindClass("Assembly-CSharp", "ForgeTax.Room", "ForgeRoom");
+    // (ForgeDeveloperTools..ctor(ForgeRoom) — dump.cs RVA 0x263C4E8.)
+    Il2CppClass *toolsClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperTools");
+    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
     if (toolsClass && roomClass && api->objectNew) {
         Il2CppObject *room = FindUnityObject(roomClass);
         if (room) {
@@ -205,7 +255,8 @@ static Il2CppObject *ResolveTools(void) {
             if (ctor) {
                 Il2CppObject *tools = api->objectNew(toolsClass);
                 if (tools) {
-                    void *args[1] = { &room };
+                    // Reference-type param: pass `room` directly (NOT &room).
+                    void *args[1] = { room };
                     Il2CppObject *exc = NULL;
                     @try { api->runtimeInvoke(ctor, tools, args, &exc); } @catch (...) { exc = (Il2CppObject *)1; }
                     if (!exc) return tools;
@@ -217,23 +268,26 @@ static Il2CppObject *ResolveTools(void) {
 }
 
 static Il2CppObject *ResolveCampaign(void) {
-    // Fresh resolve every call (see the NO CACHING note above): the
-    // campaign object is re-read from the live tools -> room chain, so a
-    // destroyed/recreated campaign can never be invoked through a stale
-    // cached pointer.
+    // Fresh resolve every call (see NO CACHING note above).
+    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+    if (roomClass) {
+        Il2CppObject *room = FindUnityObject(roomClass);
+        if (room) {
+            Il2CppObject *campaign = ReadObjectField(room, roomClass, "campaign");
+            if (campaign) return campaign;
+        }
+    }
     Il2CppObject *tools = ResolveTools();
     if (!tools) return NULL;
-    Il2CppClass *toolsClass = FindClass("Assembly-CSharp", "ForgeTax.Touch", "ForgeDeveloperTools");
-    Il2CppClass *roomClass = FindClass("Assembly-CSharp", "ForgeTax.Room", "ForgeRoom");
+    Il2CppClass *toolsClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperTools");
     if (!toolsClass || !roomClass) return NULL;
     Il2CppObject *room = ReadObjectField(tools, toolsClass, "room");
     if (!room) return NULL;
-    Il2CppObject *campaign = ReadObjectField(room, roomClass, "campaign");
-    return campaign;
+    return ReadObjectField(room, roomClass, "campaign");
 }
 
 bool FTC_BridgeReady(void) {
-    return Api()->loaded && FindImage("Assembly-CSharp") != NULL;
+    return Api()->loaded && FindImage("Assembly-CSharp.dll") != NULL;
 }
 
 bool FTC_ToolsAvailable(void) {
@@ -241,7 +295,7 @@ bool FTC_ToolsAvailable(void) {
 }
 
 // ---- Generic invoke ----
-// Calls a bool method on `obj` (or a static method when obj == NULL).
+// Calls a bool (or void) method on `obj` (or a static method when obj == NULL).
 // Returns OK only when: no exception AND (no return value OR boxed bool true
 // OR unbox unavailable, in which case no-exception counts as success).
 static FTC_CallResult InvokeBool(Il2CppClass *klass, Il2CppObject *obj,
@@ -258,15 +312,15 @@ static FTC_CallResult InvokeBool(Il2CppClass *klass, Il2CppObject *obj,
     if (exc) return FTC_CALL_ERR_EXCEPTION;
     if (!ret) return FTC_CALL_OK; // void method
     if (api->objectUnbox) {
-        bool *boxed = NULL;
-        @try { boxed = (bool *)api->objectUnbox(ret); } @catch (...) { return FTC_CALL_OK; }
-        if (boxed && !*boxed) return FTC_CALL_ERR_RETURNED_FALSE;
+        uint8_t *boxed = NULL;
+        @try { boxed = (uint8_t *)api->objectUnbox(ret); } @catch (...) { return FTC_CALL_OK; }
+        if (boxed && (*boxed == 0)) return FTC_CALL_ERR_RETURNED_FALSE;
     }
     return FTC_CALL_OK;
 }
 
 static Il2CppClass *ToolsClass(void) {
-    return FindClass("Assembly-CSharp", "ForgeTax.Touch", "ForgeDeveloperTools");
+    return FindClass("Assembly-CSharp.dll", "ForgeTax.Touch", "ForgeDeveloperTools");
 }
 
 static FTC_CallResult InvokeTools0(const char *methodName) {
@@ -285,7 +339,8 @@ static FTC_CallResult InvokeToolsDouble(const char *methodName, double value) {
 static FTC_CallResult InvokeToolsInt(const char *methodName, int value) {
     Il2CppObject *tools = ResolveTools();
     if (!tools) return FTC_CALL_ERR_NO_INSTANCE;
-    void *args[1] = { &value };
+    int32_t v = (int32_t)value;
+    void *args[1] = { &v };
     return InvokeBool(ToolsClass(), tools, methodName, 1, args);
 }
 
@@ -314,30 +369,41 @@ FTC_CallResult FTC_ToggleMerchantShelfSlot(void) { return InvokeTools0("ToggleMe
 FTC_CallResult FTC_ToggleFps(void) { return InvokeTools0("ToggleFps"); }
 
 FTC_CallResult FTC_SetQualityTier(int tier) {
-    // SetQualityTier(Nullable<QualityTier>) — QualityTier: Low=0, Mid=1,
-    // High=2 (dump.cs, ForgeTax.Quality). Nullable<T> is passed as a
-    // struct { int32 value; bool has_value } by pointer to runtime_invoke.
-    // Layout is the standard IL2CPP Nullable layout; UNPROVEN live — if
-    // the game rejects it, this returns EXCEPTION / RETURNED_FALSE.
+    // SetQualityTier(Nullable<QualityTier>) — QualityTier: Low=0, Mid=1, High=2.
+    // Verified from global-metadata.dat (mscorlib.dll System.Nullable`1) AND
+    // ARM64 disassembly at 0x24ef138 (tbz w19,#0) / 0x2edd5d4 (ldrb w8,[x0,#0]):
+    // field 0 = hasValue (bool at +0), field 1 = value (int32 at +4).
     if (tier < 0) tier = 0;
     if (tier > 2) tier = 2;
     Il2CppObject *tools = ResolveTools();
     if (!tools) return FTC_CALL_ERR_NO_INSTANCE;
-    struct { int32_t value; uint8_t hasValue; uint8_t pad[3]; } nullable;
-    nullable.value = (int32_t)tier;
+    struct {
+        uint8_t hasValue;
+        uint8_t pad[3];
+        int32_t value;
+    } nullable;
     nullable.hasValue = 1;
     nullable.pad[0] = nullable.pad[1] = nullable.pad[2] = 0;
+    nullable.value = (int32_t)tier;
     void *args[1] = { &nullable };
     return InvokeBool(ToolsClass(), tools, "SetQualityTier", 1, args);
 }
 
 FTC_CallResult FTC_AddRunTickets(int outcome, int count) {
-    // ForgeCampaign.AddRunTickets(int outcome, int count).
+    // ForgeCampaign.AddRunTickets(int outcome, int count) in ForgeTax.Rules.dll.
     // ForgeOutcome: Destruction=0, Damage=1, Hold=2, Success=3, GreatSuccess=4.
     Il2CppObject *campaign = ResolveCampaign();
     if (!campaign) return FTC_CALL_ERR_NO_INSTANCE;
-    Il2CppClass *campaignClass = FindClass("Assembly-CSharp", "ForgeTax.Rules", "ForgeCampaign");
+    Il2CppApi *api = Api();
+    Il2CppClass *campaignClass = (api->objectGetClass)
+        ? api->objectGetClass(campaign)
+        : FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+    if (!campaignClass) {
+        campaignClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+    }
     if (!campaignClass) return FTC_CALL_ERR_NO_METHOD;
-    void *args[2] = { &outcome, &count };
+    int32_t o = (int32_t)outcome;
+    int32_t c = (int32_t)count;
+    void *args[2] = { &o, &c };
     return InvokeBool(campaignClass, campaign, "AddRunTickets", 2, args);
 }

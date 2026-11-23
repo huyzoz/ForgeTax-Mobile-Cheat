@@ -17,55 +17,76 @@ static CheatMenuView *s_menuView = nil;
 static NSTimer *s_attachTimer = nil;
 static NSInteger s_attachTries = 0;
 
+static BOOL FTC_IsMainGameWindow(UIWindow *w) {
+    if (!w || w.hidden) return NO;
+    if (w.windowLevel != UIWindowLevelNormal) return NO;
+    if (w.bounds.size.width < 100.0 || w.bounds.size.height < 100.0) return NO;
+    NSString *clsName = NSStringFromClass([w class]);
+    if ([clsName containsString:@"Alert"] ||
+        [clsName containsString:@"Keyboard"] ||
+        [clsName containsString:@"TextEffects"] ||
+        [clsName containsString:@"StatusBar"]) {
+        return NO;
+    }
+    return YES;
+}
+
 static UIWindow *FTC_KeyWindow(void) {
     @try {
         UIApplication *app = [UIApplication sharedApplication];
         if (!app) return nil;
-        UIWindow *key = app.keyWindow;
-        if (key) return key;
-        // iOS 13+ multi-scene fallback: first visible window of any scene.
+
+        // iOS 13+ scene-based lookup (ForgeTax uses UIApplicationSceneManifest / UnityScene).
+        UIWindow *fallback = nil;
         for (UIScene *scene in app.connectedScenes) {
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) return w;
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            BOOL active = (ws.activationState == UISceneActivationStateForegroundActive);
+            for (UIWindow *w in ws.windows) {
+                if (!FTC_IsMainGameWindow(w)) continue;
+                if (active && w.isKeyWindow) return w;
+                if (active && !fallback) fallback = w;
+                else if (!fallback) fallback = w;
             }
         }
-        for (UIScene *scene in app.connectedScenes) {
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (!w.hidden) return w;
-            }
+        if (fallback) return fallback;
+
+        // Legacy delegate window fallback.
+        if (app.delegate && [app.delegate respondsToSelector:@selector(window)]) {
+            UIWindow *dw = app.delegate.window;
+            if (FTC_IsMainGameWindow(dw)) return dw;
         }
     } @catch (...) {}
     return nil;
 }
 
-static void FTC_TryAttach(void) {
+static void FTC_AttachIfPossible(UIWindow *preferredWindow) {
     @try {
-        UIWindow *window = FTC_KeyWindow();
+        UIWindow *window = FTC_IsMainGameWindow(preferredWindow) ? preferredWindow : FTC_KeyWindow();
         if (!window) return;
         if (!s_menuView) {
             s_menuView = [[CheatMenuView alloc] initWithFrame:window.bounds];
         }
         [s_menuView attachToWindow:window];
-        [s_attachTimer invalidate];
-        s_attachTimer = nil;
+        if (s_menuView.superview) {
+            [s_attachTimer invalidate];
+            s_attachTimer = nil;
+        }
     } @catch (...) {}
 }
 
 static void FTC_OnWindowDidBecomeKey(NSNotification *note) {
     @try {
-        UIWindow *window = (UIWindow *)note.object;
-        if (![window isKindOfClass:[UIWindow class]]) {
-            window = FTC_KeyWindow();
+        UIWindow *window = nil;
+        if ([note.object isKindOfClass:[UIWindow class]]) {
+            window = (UIWindow *)note.object;
         }
-        if (!window) return;
-        if (!s_menuView) {
-            s_menuView = [[CheatMenuView alloc] initWithFrame:window.bounds];
+        // Ignore transient windows (e.g. UIAlertController, keyboard, ads)
+        // when we are already attached to a live normal game window.
+        if (window && !FTC_IsMainGameWindow(window)) {
+            return;
         }
-        [s_menuView attachToWindow:window];
-        [s_attachTimer invalidate];
-        s_attachTimer = nil;
+        FTC_AttachIfPossible(window);
     } @catch (...) {}
 }
 
@@ -79,7 +100,7 @@ static void ForgeTaxCheatInit(void) {
                                 object:nil
                                  queue:[NSOperationQueue mainQueue]
                             usingBlock:^(NSNotification *note) { FTC_OnWindowDidBecomeKey(note); }];
-                FTC_TryAttach();
+                FTC_AttachIfPossible(nil);
                 if (!s_menuView || !s_menuView.superview) {
                     // Light retry: 1s interval, stops on attach or after
                     // 60 tries. No timer survives past attach.
@@ -88,7 +109,7 @@ static void ForgeTaxCheatInit(void) {
                                                                      repeats:YES
                                                                        block:^(NSTimer *t) {
                         s_attachTries++;
-                        FTC_TryAttach();
+                        FTC_AttachIfPossible(nil);
                         if ((!s_menuView || !s_menuView.superview) && s_attachTries >= 60) {
                             [t invalidate];
                             s_attachTimer = nil;
