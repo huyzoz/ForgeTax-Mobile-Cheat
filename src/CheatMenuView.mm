@@ -18,6 +18,7 @@
 #import "PatchEngine.h"
 #import "GameBridge.h"
 #import "LogoImageData.h"
+#import "DonateQrData.h"
 
 #import <QuartzCore/QuartzCore.h>
 #include <math.h>
@@ -46,6 +47,12 @@
 #define FTC_C_ERR        0xFF8A65
 #define FTC_C_FPS_BG     0x120C0D
 #define FTC_C_FPS_TXT    0x7DFF8A
+#define FTC_C_DISCORD    0x5865F2
+#define FTC_C_GITHUB     0x24292F
+#define FTC_C_TIKTOK     0x151215
+#define FTC_C_TIKTOK_HI  0xFE2C55
+#define FTC_C_MOMO       0xA50064
+#define FTC_C_MOMO_HI    0xE83E8C
 
 static UIColor *FTC_Color(uint32_t hex) {
     return [UIColor colorWithRed:((hex >> 16) & 0xFF) / 255.0
@@ -91,14 +98,31 @@ static const FTCTab kTabs[] = {
 static const NSInteger kTabCount = (NSInteger)(sizeof(kTabs) / sizeof(kTabs[0]));
 static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 
-#pragma mark - FTCMarqueeLabel (GPU-only glide + dual-edge fade when overflowing)
+#pragma mark - FTCScrollView (100% Instant Scroll Anywhere, Even Over UIButtons!)
+
+@interface FTCScrollView : UIScrollView
+@end
+
+@implementation FTCScrollView
+// Default UIScrollView returns NO for UIControl (UIButton), blocking scroll
+// whenever a finger lands on a button. Returning YES guarantees immediate,
+// 100% responsive scrolling anywhere on any card while taps still work!
+- (BOOL)touchesShouldCancelInContentView:(UIView *)view {
+    return YES;
+}
+@end
+
+#pragma mark - FTCMarqueeLabel (Zero-Offscreen Dual-Edge Fade + GPU Glide)
 
 @interface FTCMarqueeLabel : UIView
 @property (nonatomic, strong) UILabel *label;
-@property (nonatomic, strong) CAGradientLayer *fadeMask;
+@property (nonatomic, strong) CAGradientLayer *leftFade;
+@property (nonatomic, strong) CAGradientLayer *rightFade;
 @property (nonatomic, copy) NSString *currentText;
 @property (nonatomic, assign) CGFloat lastWidth;
-- (void)configureText:(NSString *)text font:(UIFont *)font color:(UIColor *)color;
+@property (nonatomic, assign) BOOL isOverflowing;
+- (void)configureText:(NSString *)text font:(UIFont *)font color:(UIColor *)color bgColor:(UIColor *)bgColor;
+- (void)updateEdgeFadeBgColor:(UIColor *)bgColor;
 @end
 
 @implementation FTCMarqueeLabel
@@ -117,13 +141,25 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
     return self;
 }
 
-- (void)configureText:(NSString *)text font:(UIFont *)font color:(UIColor *)color {
+- (void)updateEdgeFadeBgColor:(UIColor *)bgColor {
+    if (!self.isOverflowing || !bgColor) return;
+    UIColor *clearBg = [bgColor colorWithAlphaComponent:0.0];
+    if (self.leftFade) {
+        self.leftFade.colors = @[(id)bgColor.CGColor, (id)clearBg.CGColor];
+    }
+    if (self.rightFade) {
+        self.rightFade.colors = @[(id)clearBg.CGColor, (id)bgColor.CGColor];
+    }
+}
+
+- (void)configureText:(NSString *)text font:(UIFont *)font color:(UIColor *)color bgColor:(UIColor *)bgColor {
     NSString *safeText = text ?: @"";
     self.label.font = font;
     self.label.textColor = color;
     CGFloat viewW = self.bounds.size.width;
     CGFloat viewH = self.bounds.size.height;
     if ([self.currentText isEqualToString:safeText] && fabs(self.lastWidth - viewW) < 1.0) {
+        [self updateEdgeFadeBgColor:bgColor];
         return;
     }
     self.currentText = safeText;
@@ -133,32 +169,40 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
     self.label.layer.transform = CATransform3DIdentity;
 
     CGFloat textW = ceil([safeText sizeWithAttributes:@{NSFontAttributeName: font}].width);
-    if (textW <= viewW || viewW < 20.0) {
-        // Fits statically: ZERO mask, ZERO animation, ZERO GPU cost!
+    if (textW <= viewW || viewW < 24.0) {
+        self.isOverflowing = NO;
         self.label.frame = CGRectMake(0, 0, viewW, viewH);
-        self.layer.mask = nil;
+        self.leftFade.hidden = YES;
+        self.rightFade.hidden = YES;
         return;
     }
 
-    // Overflows: apply smooth fade on BOTH left & right edges + GPU-only keyframe glide.
+    // Overflows: use two lightweight 12pt gradient edge overlays (ZERO CALayer.mask
+    // offscreen render pass!) + GPU-only keyframe glide animation.
+    self.isOverflowing = YES;
     CGFloat edgePad = 8.0;
+    CGFloat fadeW = 12.0;
     self.label.frame = CGRectMake(edgePad, 0, textW + edgePad, viewH);
 
-    if (!self.fadeMask) {
-        CAGradientLayer *g = [CAGradientLayer layer];
-        g.startPoint = CGPointMake(0.0, 0.5);
-        g.endPoint = CGPointMake(1.0, 0.5);
-        g.colors = @[
-            (id)[UIColor clearColor].CGColor,
-            (id)[UIColor blackColor].CGColor,
-            (id)[UIColor blackColor].CGColor,
-            (id)[UIColor clearColor].CGColor,
-        ];
-        g.locations = @[@0.0, @0.09, @0.91, @1.0];
-        self.fadeMask = g;
+    if (!self.leftFade) {
+        CAGradientLayer *lf = [CAGradientLayer layer];
+        lf.startPoint = CGPointMake(0.0, 0.5);
+        lf.endPoint = CGPointMake(1.0, 0.5);
+        [self.layer addSublayer:lf];
+        self.leftFade = lf;
     }
-    self.fadeMask.frame = self.bounds;
-    self.layer.mask = self.fadeMask;
+    if (!self.rightFade) {
+        CAGradientLayer *rf = [CAGradientLayer layer];
+        rf.startPoint = CGPointMake(0.0, 0.5);
+        rf.endPoint = CGPointMake(1.0, 0.5);
+        [self.layer addSublayer:rf];
+        self.rightFade = rf;
+    }
+    self.leftFade.frame = CGRectMake(0, 0, fadeW, viewH);
+    self.rightFade.frame = CGRectMake(viewW - fadeW, 0, fadeW, viewH);
+    self.leftFade.hidden = NO;
+    self.rightFade.hidden = NO;
+    [self updateEdgeFadeBgColor:bgColor];
 
     CGFloat travel = (textW + edgePad * 2.0) - viewW;
     CFTimeInterval moveDur = MAX(2.0, travel / 32.0);
@@ -200,8 +244,16 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 @property (nonatomic, strong) UIView *sidebarDivider;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *tabButtons;
 @property (nonatomic, strong) NSMutableArray<UIView *> *tabIndicators;
-@property (nonatomic, strong) UIScrollView *scrollView;
+@property (nonatomic, strong) FTCScrollView *scrollView;
 @property (nonatomic, strong) UIButton *resetAllButton;
+
+// Launch Welcome Popup + MoMo QR Donate modal (created on demand, removed on close -> 0 GPU cost in game)
+@property (nonatomic, strong) UIView *welcomeOverlay;
+@property (nonatomic, strong) UIView *welcomeCard;
+@property (nonatomic, strong) UIView *welcomeMainBox;
+@property (nonatomic, strong) UIView *welcomeQrBox;
+@property (nonatomic, assign) BOOL launchWelcomeShown;
+@property (nonatomic, assign) BOOL returningFromExternalLink;
 
 // Active tab card references for O(1) in-place updates (ZERO view rebuild on tap)
 @property (nonatomic, strong) NSMutableDictionary<NSNumber *, UIView *> *cardMap;
@@ -305,6 +357,9 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 }
 
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    if (self.welcomeOverlay) {
+        return [super hitTest:point withEvent:event];
+    }
     if (CGRectContainsPoint(self.logoButton.frame, point)) {
         return [super hitTest:point withEvent:event];
     }
@@ -528,14 +583,16 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
         [self.tabIndicators addObject:ind];
     }
 
-    // Right ScrollView: solid opaque, NO cornerRadius -> 0 offscreen rendering!
-    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:CGRectZero];
+    // Right FTCScrollView: 100% instant scroll even when touch starts on a UIButton!
+    FTCScrollView *scroll = [[FTCScrollView alloc] initWithFrame:CGRectZero];
     scroll.backgroundColor = FTC_Color(FTC_C_PANEL);
     scroll.opaque = YES;
     scroll.clipsToBounds = YES;
     scroll.showsVerticalScrollIndicator = YES;
-    scroll.alwaysBounceVertical = NO;
+    scroll.alwaysBounceVertical = YES;
+    scroll.canCancelContentTouches = YES;
     scroll.delaysContentTouches = NO;
+    scroll.decelerationRate = UIScrollViewDecelerationRateNormal;
     [panel addSubview:scroll];
     self.scrollView = scroll;
 
@@ -555,7 +612,32 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
         [self ensureLogoPositioned];
         [self layoutFpsBadge];
         if (_menuOpen) [self layoutPanel];
+        if (self.welcomeOverlay) [self layoutWelcomeOverlay];
         [self scheduleStaggeredRestoreIfNeeded];
+        if (!self.launchWelcomeShown) {
+            self.launchWelcomeShown = YES;
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf showWelcomePopup];
+            });
+        }
+    } @catch (...) {}
+}
+
+- (void)onAppEnteredForeground {
+    @try {
+        if (self.returningFromExternalLink) {
+            self.returningFromExternalLink = NO;
+            return;
+        }
+        if (!self.welcomeOverlay && self.superview) {
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf showWelcomePopup];
+            });
+        }
     } @catch (...) {}
 }
 
@@ -613,6 +695,7 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
             self.lastLayoutSize = self.bounds.size;
             [self layoutFpsBadge];
             if (_menuOpen) [self layoutPanel];
+            if (self.welcomeOverlay) [self layoutWelcomeOverlay];
         }
     } @catch (...) {}
 }
@@ -842,12 +925,26 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 
         CGFloat totalH = MAX(colY[0], colY[1]);
         if (strcmp(cid, "setting") == 0) {
+            CGFloat halfBtnW = floor((W - pad * 2.0 - gap) * 0.5);
+            UIButton *infoBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+            infoBtn.frame = CGRectMake(pad, totalH + 2.0, halfBtnW, 32.0);
+            [infoBtn setTitle:[self L:@"Cộng đồng & Ủng hộ (QR)" en:@"Community & Donate (QR)"]
+                     forState:UIControlStateNormal];
+            infoBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
+            [infoBtn setTitleColor:FTC_Color(FTC_C_TEXT) forState:UIControlStateNormal];
+            infoBtn.backgroundColor = FTC_Color(FTC_C_MOMO);
+            infoBtn.opaque = YES;
+            infoBtn.layer.cornerRadius = 9.0;
+            infoBtn.layer.borderColor = FTC_Color(FTC_C_MOMO_HI).CGColor;
+            infoBtn.layer.borderWidth = 1.0;
+            [infoBtn addTarget:self action:@selector(showWelcomePopup) forControlEvents:UIControlEventTouchUpInside];
+            [self.scrollView addSubview:infoBtn];
+
             UIButton *resetBtn = [UIButton buttonWithType:UIButtonTypeCustom];
-            resetBtn.frame = CGRectMake(pad, totalH + 2.0, W - pad * 2.0, 32.0);
-            [resetBtn setTitle:[self L:@"Tắt hết cheat & Xóa cấu hình đã lưu"
-                                    en:@"Disable All Cheats & Clear Saved Config"]
+            resetBtn.frame = CGRectMake(pad + halfBtnW + gap, totalH + 2.0, halfBtnW, 32.0);
+            [resetBtn setTitle:[self L:@"Tắt hết & Xóa lưu" en:@"Reset All & Clear"]
                       forState:UIControlStateNormal];
-            resetBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11.5];
+            resetBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
             [resetBtn setTitleColor:FTC_Color(FTC_C_CRIMSON_HI) forState:UIControlStateNormal];
             resetBtn.backgroundColor = FTC_Color(FTC_C_TAB_ON);
             resetBtn.opaque = YES;
@@ -860,7 +957,7 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
             totalH += 40.0;
         }
 
-        self.scrollView.contentSize = CGSizeMake(W, MAX(totalH + 4.0, self.scrollView.bounds.size.height));
+        self.scrollView.contentSize = CGSizeMake(W, MAX(totalH + 6.0, self.scrollView.bounds.size.height + 1.0));
     } @catch (...) {}
 }
 
@@ -893,10 +990,10 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
 
     CGFloat textW = MAX(56.0, W - ctrlAreaW - 18.0);
 
-    // Title marquee (tap region behind it toggles full description vs status)
+    // Title marquee (zero-offscreen dual-edge fade)
     FTCMarqueeLabel *titleM = [[FTCMarqueeLabel alloc] initWithFrame:CGRectMake(9, 7, textW, 18)];
     NSString *titleStr = [NSString stringWithUTF8String:(self.english ? f->name_en : f->name_vi)];
-    [titleM configureText:titleStr font:[UIFont boldSystemFontOfSize:12.5] color:FTC_Color(FTC_C_TEXT)];
+    [titleM configureText:titleStr font:[UIFont boldSystemFontOfSize:12.5] color:FTC_Color(FTC_C_TEXT) bgColor:card.backgroundColor];
     [card addSubview:titleM];
     self.titleMarqueeMap[@(f->fid)] = titleM;
 
@@ -1170,19 +1267,21 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
     if (!f) return;
     FTCMarqueeLabel *sub = self.subMarqueeMap[@(f->fid)];
     if (!sub) return;
+    UIView *card = self.cardMap[@(f->fid)];
+    UIColor *bg = card ? card.backgroundColor : FTC_Color(FTC_C_CARD);
     NSString *status = self.statusText[@(f->fid)];
     BOOL showDesc = [self.descOpen[@(f->fid)] boolValue];
     NSInteger kind = [self.statusKind[@(f->fid)] integerValue];
     UIFont *font = [UIFont systemFontOfSize:10.5];
     if (showDesc || status.length == 0) {
         NSString *desc = [NSString stringWithUTF8String:(self.english ? f->desc_en : f->desc_vi)];
-        [sub configureText:desc font:font color:FTC_Color(FTC_C_TEXT2)];
+        [sub configureText:desc font:font color:FTC_Color(FTC_C_TEXT2) bgColor:bg];
     } else {
         UIColor *col = (kind == 3) ? FTC_Color(FTC_C_PURPLE_HI)
                      : (kind == 1) ? FTC_Color(FTC_C_OK)
                      : (kind == 2) ? FTC_Color(FTC_C_ERR)
                                    : FTC_Color(FTC_C_TEXT2);
-        [sub configureText:status font:font color:col];
+        [sub configureText:status font:font color:col bgColor:bg];
     }
 }
 
@@ -1193,13 +1292,16 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
     BOOL isPurple = (fid == 4 && self.forgeGreatMode);
     UIView *card = self.cardMap[@(fid)];
     if (card) {
-        card.backgroundColor = (on && isPurple) ? FTC_Color(FTC_C_CARD_PURP)
-                             : on               ? FTC_Color(FTC_C_CARD_ON)
-                                                : FTC_Color(FTC_C_CARD);
+        UIColor *bg = (on && isPurple) ? FTC_Color(FTC_C_CARD_PURP)
+                    : on               ? FTC_Color(FTC_C_CARD_ON)
+                                       : FTC_Color(FTC_C_CARD);
+        card.backgroundColor = bg;
         card.layer.borderColor = (on && isPurple) ? FTC_Color(FTC_C_PURPLE).CGColor
                                : on               ? FTC_Color(FTC_C_CRIMSON).CGColor
                                : isPurple         ? FTC_Color(FTC_C_PURPLE).CGColor
                                                   : FTC_Color(FTC_C_BORDER).CGColor;
+        FTCMarqueeLabel *tm = self.titleMarqueeMap[@(fid)];
+        if (tm) [tm updateEdgeFadeBgColor:bg];
     }
     [self styleFlatToggleButton:self.toggleBtnMap[@(fid)] on:on purple:isPurple];
     if (fid == 4) {
@@ -1836,6 +1938,353 @@ static const float kSpeedValues[] = { 1.0f, 1.5f, 2.0f, 3.0f };
                         : [self messageForCall:cr]
                    kind:(cr == FTC_CALL_OK) ? 1 : 2];
         [self updateCardInPlace:fid];
+    } @catch (...) {}
+}
+
+#pragma mark - Cinematic 16:9 Launch Welcome Popup + MoMo QR Donate Modal
+
+- (void)showWelcomePopup {
+    @try {
+        if (self.welcomeOverlay) return;
+        if (self.bounds.size.width < 120 || self.bounds.size.height < 120) return;
+
+        // Lightweight scrim ONLY while popup is visible (completely removed on close!)
+        UIView *overlay = [[UIView alloc] initWithFrame:self.bounds];
+        overlay.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.64];
+        overlay.alpha = 0.0;
+        [self addSubview:overlay];
+        self.welcomeOverlay = overlay;
+
+        // macOS-style Obsidian Cinematic 16:9 Card (matching forgetax_cinematic_banner_16_9.html)
+        UIView *card = [[UIView alloc] initWithFrame:CGRectZero];
+        card.backgroundColor = FTC_Color(0x0B0E1A);
+        card.opaque = YES;
+        card.layer.cornerRadius = 16.0;
+        card.layer.borderColor = FTC_Color(0x2D3554).CGColor;
+        card.layer.borderWidth = 1.2;
+        card.layer.masksToBounds = YES;
+        [overlay addSubview:card];
+        self.welcomeCard = card;
+
+        // ---- Main Welcome View ----
+        UIView *mainBox = [[UIView alloc] initWithFrame:CGRectZero];
+        mainBox.backgroundColor = FTC_Color(0x0B0E1A);
+        mainBox.opaque = YES;
+        [card addSubview:mainBox];
+        self.welcomeMainBox = mainBox;
+
+        // macOS Titlebar
+        UIView *tbar = [[UIView alloc] initWithFrame:CGRectZero];
+        tbar.backgroundColor = FTC_Color(0x121729);
+        tbar.opaque = YES;
+        tbar.tag = 5001;
+        [mainBox addSubview:tbar];
+
+        // Traffic lights (red dot also closes popup!)
+        uint32_t dotHex[3] = { 0xFF5F56, 0xFFBD2E, 0x27C93F };
+        for (NSInteger d = 0; d < 3; d++) {
+            UIButton *dot = [UIButton buttonWithType:UIButtonTypeCustom];
+            dot.frame = CGRectMake(12 + d * 16, 10, 10, 10);
+            dot.backgroundColor = FTC_Color(dotHex[d]);
+            dot.layer.cornerRadius = 5.0;
+            if (d == 0) {
+                [dot addTarget:self action:@selector(onCloseWelcomePopup) forControlEvents:UIControlEventTouchUpInside];
+            }
+            [tbar addSubview:dot];
+        }
+
+        UILabel *tabChip = [[UILabel alloc] initWithFrame:CGRectMake(68, 5, 168, 20)];
+        tabChip.text = @"★  Forgetax — Cinematic";
+        tabChip.font = [UIFont boldSystemFontOfSize:10.5];
+        tabChip.textColor = FTC_Color(0xF8FAFC);
+        tabChip.backgroundColor = FTC_Color(0x1E2642);
+        tabChip.opaque = YES;
+        tabChip.textAlignment = NSTextAlignmentCenter;
+        tabChip.layer.cornerRadius = 6.0;
+        tabChip.layer.masksToBounds = YES;
+        [tbar addSubview:tabChip];
+
+        UILabel *onlinePill = [[UILabel alloc] initWithFrame:CGRectZero];
+        onlinePill.text = @"● ONLINE • OPEN SOURCE";
+        onlinePill.font = [UIFont monospacedDigitSystemFontOfSize:9.5 weight:UIFontWeightBold];
+        onlinePill.textColor = FTC_Color(0x6EE7B7);
+        onlinePill.backgroundColor = FTC_Color(0x0D2924);
+        onlinePill.opaque = YES;
+        onlinePill.textAlignment = NSTextAlignmentCenter;
+        onlinePill.layer.cornerRadius = 9.0;
+        onlinePill.layer.masksToBounds = YES;
+        onlinePill.tag = 5002;
+        [tbar addSubview:onlinePill];
+
+        // Hero Section
+        UILabel *heroBadge = [[UILabel alloc] initWithFrame:CGRectZero];
+        heroBadge.text = @"• CINEMATIC CHEAT SUITE • FREE & OPEN SOURCE •";
+        heroBadge.font = [UIFont boldSystemFontOfSize:9.0];
+        heroBadge.textColor = FTC_Color(0xC7D2FE);
+        heroBadge.backgroundColor = FTC_Color(0x191F3D);
+        heroBadge.opaque = YES;
+        heroBadge.textAlignment = NSTextAlignmentCenter;
+        heroBadge.layer.cornerRadius = 9.0;
+        heroBadge.layer.masksToBounds = YES;
+        heroBadge.tag = 5003;
+        [mainBox addSubview:heroBadge];
+
+        UILabel *heroTitle = [[UILabel alloc] initWithFrame:CGRectZero];
+        heroTitle.text = @"FORGETAX  •  CINEMATIC";
+        heroTitle.font = [UIFont boldSystemFontOfSize:22.0];
+        heroTitle.textColor = FTC_Color(0xF8FAFC);
+        heroTitle.textAlignment = NSTextAlignmentCenter;
+        heroTitle.tag = 5004;
+        [mainBox addSubview:heroTitle];
+
+        UILabel *heroSub = [[UILabel alloc] initWithFrame:CGRectZero];
+        heroSub.text = [self L:@"Tối ưu trải nghiệm Cheat Game & Quay Cinematic mượt mà, mã nguồn mở minh bạch."
+                            en:@"Optimized smooth Game Cheat & Cinematic suite — free & open source."];
+        heroSub.font = [UIFont systemFontOfSize:11.0];
+        heroSub.textColor = FTC_Color(0xCBD5E1);
+        heroSub.textAlignment = NSTextAlignmentCenter;
+        heroSub.numberOfLines = 2;
+        heroSub.tag = 5005;
+        [mainBox addSubview:heroSub];
+
+        // 3 Social Action Cards (ONLY open real URLs when actually clicked!)
+        NSArray<NSDictionary *> *socials = @[
+            @{@"title": [self L:@"Tham Gia Discord" en:@"Join Discord"],
+              @"sub":   [self L:@"Cộng đồng & hỗ trợ" en:@"Community & support"],
+              @"bg":    @(0x1C214A), @"bd": @(FTC_C_DISCORD), @"ac": @(0x8EA1FF), @"tag": @(1)},
+            @{@"title": [self L:@"Xem Mã Nguồn" en:@"Source Code"],
+              @"sub":   [self L:@"Mã nguồn mở GitHub" en:@"Open source GitHub"],
+              @"bg":    @(0x191F2E), @"bd": @(0x64748B), @"ac": @(0xF1F5F9), @"tag": @(2)},
+            @{@"title": [self L:@"TikTok Gốc" en:@"Official TikTok"],
+              @"sub":   [self L:@"Chính chủ & Showcase" en:@"Creator & Showcase"],
+              @"bg":    @(0x241320), @"bd": @(FTC_C_TIKTOK_HI), @"ac": @(0x25F4EE), @"tag": @(3)},
+        ];
+        for (NSInteger i = 0; i < 3; i++) {
+            NSDictionary *s = socials[i];
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+            btn.backgroundColor = FTC_Color([s[@"bg"] unsignedIntValue]);
+            btn.opaque = YES;
+            btn.layer.cornerRadius = 11.0;
+            btn.layer.borderColor = FTC_Color([s[@"bd"] unsignedIntValue]).CGColor;
+            btn.layer.borderWidth = 1.2;
+            btn.tag = 5100 + [s[@"tag"] integerValue];
+            [btn addTarget:self action:@selector(onOpenExternalLink:) forControlEvents:UIControlEventTouchUpInside];
+
+            UILabel *tl = [[UILabel alloc] initWithFrame:CGRectZero];
+            tl.text = s[@"title"];
+            tl.font = [UIFont boldSystemFontOfSize:12.0];
+            tl.textColor = FTC_Color([s[@"ac"] unsignedIntValue]);
+            tl.textAlignment = NSTextAlignmentCenter;
+            tl.userInteractionEnabled = NO;
+            tl.tag = 1;
+            [btn addSubview:tl];
+
+            UILabel *sl = [[UILabel alloc] initWithFrame:CGRectZero];
+            sl.text = s[@"sub"];
+            sl.font = [UIFont systemFontOfSize:9.5];
+            sl.textColor = FTC_Color(0xCBD5E1);
+            sl.textAlignment = NSTextAlignmentCenter;
+            sl.userInteractionEnabled = NO;
+            sl.tag = 2;
+            [btn addSubview:sl];
+
+            [mainBox addSubview:btn];
+        }
+
+        // Bottom Row: [ ♥ Ủng hộ (QR MoMo) ] + [ Tiếp tục vào game → ]
+        UIButton *donateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        [donateBtn setTitle:[self L:@"♥  Ủng hộ (QR MoMo)" en:@"♥  Donate (MoMo QR)"] forState:UIControlStateNormal];
+        donateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [donateBtn setTitleColor:FTC_Color(0xFFFFFF) forState:UIControlStateNormal];
+        donateBtn.backgroundColor = FTC_Color(FTC_C_MOMO);
+        donateBtn.opaque = YES;
+        donateBtn.layer.cornerRadius = 10.0;
+        donateBtn.layer.borderColor = FTC_Color(FTC_C_MOMO_HI).CGColor;
+        donateBtn.layer.borderWidth = 1.0;
+        donateBtn.tag = 5006;
+        [donateBtn addTarget:self action:@selector(onShowDonateQr) forControlEvents:UIControlEventTouchUpInside];
+        [mainBox addSubview:donateBtn];
+
+        UIButton *continueBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        [continueBtn setTitle:[self L:@"Tiếp tục vào game  →" en:@"Continue to Game  →"] forState:UIControlStateNormal];
+        continueBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.5];
+        [continueBtn setTitleColor:FTC_Color(0xFFFFFF) forState:UIControlStateNormal];
+        continueBtn.backgroundColor = FTC_Color(0x4F46E5);
+        continueBtn.opaque = YES;
+        continueBtn.layer.cornerRadius = 10.0;
+        continueBtn.layer.borderColor = FTC_Color(0x818CF8).CGColor;
+        continueBtn.layer.borderWidth = 1.0;
+        continueBtn.tag = 5007;
+        [continueBtn addTarget:self action:@selector(onCloseWelcomePopup) forControlEvents:UIControlEventTouchUpInside];
+        [mainBox addSubview:continueBtn];
+
+        // ---- QR Donate View (hidden until user taps Ủng hộ) ----
+        UIView *qrBox = [[UIView alloc] initWithFrame:CGRectZero];
+        qrBox.backgroundColor = FTC_Color(0xFFF0F7);
+        qrBox.opaque = YES;
+        qrBox.hidden = YES;
+        [card addSubview:qrBox];
+        self.welcomeQrBox = qrBox;
+
+        UIImageView *qrImg = [[UIImageView alloc] initWithFrame:CGRectZero];
+        qrImg.contentMode = UIViewContentModeScaleAspectFit;
+        qrImg.backgroundColor = FTC_Color(0xFFF0F7);
+        qrImg.opaque = YES;
+        qrImg.tag = 5201;
+        [qrBox addSubview:qrImg];
+
+        UIButton *backBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        [backBtn setTitle:[self L:@"←  Quay lại" en:@"←  Back"] forState:UIControlStateNormal];
+        backBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [backBtn setTitleColor:FTC_Color(0xFFFFFF) forState:UIControlStateNormal];
+        backBtn.backgroundColor = FTC_Color(0x1E2642);
+        backBtn.opaque = YES;
+        backBtn.layer.cornerRadius = 9.0;
+        backBtn.tag = 5202;
+        [backBtn addTarget:self action:@selector(onBackFromQr) forControlEvents:UIControlEventTouchUpInside];
+        [qrBox addSubview:backBtn];
+
+        UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+        [doneBtn setTitle:[self L:@"Vào game" en:@"Close"] forState:UIControlStateNormal];
+        doneBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [doneBtn setTitleColor:FTC_Color(0xFFFFFF) forState:UIControlStateNormal];
+        doneBtn.backgroundColor = FTC_Color(FTC_C_MOMO);
+        doneBtn.opaque = YES;
+        doneBtn.layer.cornerRadius = 9.0;
+        doneBtn.tag = 5203;
+        [doneBtn addTarget:self action:@selector(onCloseWelcomePopup) forControlEvents:UIControlEventTouchUpInside];
+        [qrBox addSubview:doneBtn];
+
+        [self layoutWelcomeOverlay];
+
+        // Smooth GPU-only entrance animation (0 layout thrash)
+        card.transform = CGAffineTransformMakeScale(0.94, 0.94);
+        [UIView animateWithDuration:0.20
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseOut
+                         animations:^{
+            overlay.alpha = 1.0;
+            card.transform = CGAffineTransformIdentity;
+        } completion:nil];
+    } @catch (...) {}
+}
+
+- (void)layoutWelcomeOverlay {
+    if (!self.welcomeOverlay || !self.welcomeCard) return;
+    self.welcomeOverlay.frame = self.bounds;
+    UIEdgeInsets safe = [self ftcSafeInsets];
+    CGFloat availW = MAX(280.0, self.bounds.size.width - safe.left - safe.right);
+    CGFloat availH = MAX(220.0, self.bounds.size.height - safe.top - safe.bottom);
+
+    CGFloat cw = MIN(520.0, availW - 12.0);
+    CGFloat ch = MIN(296.0, availH - 8.0);
+    CGFloat cx = safe.left + floor((availW - cw) * 0.5);
+    CGFloat cy = safe.top + floor((availH - ch) * 0.5);
+    self.welcomeCard.frame = CGRectMake(cx, cy, floor(cw), floor(ch));
+    self.welcomeMainBox.frame = self.welcomeCard.bounds;
+    self.welcomeQrBox.frame = self.welcomeCard.bounds;
+
+    CGFloat W = self.welcomeCard.bounds.size.width;
+    CGFloat H = self.welcomeCard.bounds.size.height;
+
+    UIView *tbar = [self.welcomeMainBox viewWithTag:5001];
+    tbar.frame = CGRectMake(0, 0, W, 30.0);
+    UIView *onlinePill = [tbar viewWithTag:5002];
+    onlinePill.frame = CGRectMake(W - 154.0, 5.0, 144.0, 20.0);
+
+    UIView *heroBadge = [self.welcomeMainBox viewWithTag:5003];
+    CGFloat bw = MIN(290.0, W - 24.0);
+    heroBadge.frame = CGRectMake(floor((W - bw) * 0.5), 40.0, bw, 18.0);
+
+    UIView *heroTitle = [self.welcomeMainBox viewWithTag:5004];
+    heroTitle.frame = CGRectMake(12.0, 62.0, W - 24.0, 28.0);
+
+    UIView *heroSub = [self.welcomeMainBox viewWithTag:5005];
+    heroSub.frame = CGRectMake(20.0, 92.0, W - 40.0, 30.0);
+
+    // 3 social cards evenly spaced
+    CGFloat padX = 14.0, gap = 8.0;
+    CGFloat cardW = floor((W - padX * 2.0 - gap * 2.0) / 3.0);
+    CGFloat cardH = 58.0;
+    CGFloat cardY = floor(H - 114.0);
+    for (NSInteger i = 0; i < 3; i++) {
+        UIView *b = [self.welcomeMainBox viewWithTag:5101 + i];
+        b.frame = CGRectMake(padX + i * (cardW + gap), cardY, cardW, cardH);
+        UIView *tl = [b viewWithTag:1];
+        UIView *sl = [b viewWithTag:2];
+        tl.frame = CGRectMake(4, 11, cardW - 8, 18);
+        sl.frame = CGRectMake(4, 31, cardW - 8, 16);
+    }
+
+    // Bottom buttons
+    CGFloat btnY = H - 46.0;
+    CGFloat btnW = floor((W - padX * 2.0 - 10.0) * 0.5);
+    [self.welcomeMainBox viewWithTag:5006].frame = CGRectMake(padX, btnY, btnW, 34.0);
+    [self.welcomeMainBox viewWithTag:5007].frame = CGRectMake(padX + btnW + 10.0, btnY, btnW, 34.0);
+
+    // QR box layout (side-by-side clean in landscape so QR is huge & scannable!)
+    CGFloat qrAreaH = H - 16.0;
+    CGFloat qrW = MIN(W - 140.0, qrAreaH * 0.94);
+    UIView *qrImg = [self.welcomeQrBox viewWithTag:5201];
+    qrImg.frame = CGRectMake(12.0, 8.0, floor(qrW), floor(qrAreaH));
+
+    CGFloat sideX = 12.0 + floor(qrW) + 12.0;
+    CGFloat sideW = MAX(96.0, W - sideX - 12.0);
+    [self.welcomeQrBox viewWithTag:5202].frame = CGRectMake(sideX, floor(H * 0.5) - 38.0, sideW, 34.0);
+    [self.welcomeQrBox viewWithTag:5203].frame = CGRectMake(sideX, floor(H * 0.5) + 4.0, sideW, 34.0);
+}
+
+- (void)onOpenExternalLink:(UIButton *)sender {
+    @try {
+        NSString *urlStr = nil;
+        if (sender.tag == 5101) urlStr = @"https://discord.gg/FqZzJJcM4";
+        else if (sender.tag == 5102) urlStr = @"https://github.com/duyzoz/ForgeTax-Mobile-Cheat";
+        else if (sender.tag == 5103) urlStr = @"https://www.tiktok.com/@duyzoz";
+        if (!urlStr) return;
+        NSURL *url = [NSURL URLWithString:urlStr];
+        if (!url) return;
+        self.returningFromExternalLink = YES;
+        [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
+    } @catch (...) {}
+}
+
+- (void)onShowDonateQr {
+    @try {
+        UIImageView *qrImg = (UIImageView *)[self.welcomeQrBox viewWithTag:5201];
+        if (qrImg && !qrImg.image) {
+            NSData *qrData = [NSData dataWithBytesNoCopy:(void *)kFTC_DonateQrData
+                                                  length:kFTC_DonateQrSize
+                                            freeWhenDone:NO];
+            qrImg.image = [UIImage imageWithData:qrData];
+        }
+        self.welcomeMainBox.hidden = YES;
+        self.welcomeQrBox.hidden = NO;
+    } @catch (...) {}
+}
+
+- (void)onBackFromQr {
+    self.welcomeQrBox.hidden = YES;
+    self.welcomeMainBox.hidden = NO;
+}
+
+- (void)onCloseWelcomePopup {
+    @try {
+        UIView *ov = self.welcomeOverlay;
+        UIView *card = self.welcomeCard;
+        if (!ov) return;
+        self.welcomeOverlay = nil;
+        self.welcomeCard = nil;
+        self.welcomeMainBox = nil;
+        self.welcomeQrBox = nil;
+        [UIView animateWithDuration:0.16
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseIn
+                         animations:^{
+            ov.alpha = 0.0;
+            card.transform = CGAffineTransformMakeScale(0.95, 0.95);
+        } completion:^(BOOL finished) {
+            [ov removeFromSuperview];
+        }];
     } @catch (...) {}
 }
 

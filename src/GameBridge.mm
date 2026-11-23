@@ -452,7 +452,9 @@ FTC_CallResult FTC_SetAntiLag(bool enabled) {
     bool anyOk = false;
     Il2CppClass *appClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Application");
     if (appClass) {
-        int32_t fps = enabled ? 120 : 60;
+        // 240 tells Unity to run at the display's maximum hardware refresh rate
+        // (60 Hz on iPhone 7 Plus, 120 Hz on ProMotion iPhones/iPads, etc.).
+        int32_t fps = enabled ? 240 : 60;
         void *args[1] = { &fps };
         if (InvokeBool(appClass, NULL, "set_targetFrameRate", 1, args) == FTC_CALL_OK) {
             anyOk = true;

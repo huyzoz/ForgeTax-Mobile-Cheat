@@ -76,12 +76,18 @@ jobs:
           # Record UnityFramework hash BEFORE any modification.
           shasum -a 256 "$APP/Frameworks/UnityFramework.framework/UnityFramework" | awk '{print $1}' | tee ../unity-before.txt
 
-      - name: Inject dylib load command (LIEF)
+      - name: Inject dylib load command (LIEF) & enable 120Hz ProMotion
         run: |
           python3 -m pip install --break-system-packages lief
           python3 scripts/inject_dylib.py "work/$APP" "@executable_path/Frameworks/ForgeTaxCheat.dylib"
           mkdir -p "work/$APP/Frameworks"
           cp ForgeTaxCheat.dylib "work/$APP/Frameworks/ForgeTaxCheat.dylib"
+          # Unlock native 120Hz ProMotion on iPhone 13 Pro+ / iPad Pro (iOS 15+)
+          # without touching UnityFramework.
+          PLIST="work/$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CADisableMinimumFrameDurationOnPhone true" "$PLIST" 2>/dev/null \
+            || /usr/libexec/PlistBuddy -c "Add :CADisableMinimumFrameDurationOnPhone bool true" "$PLIST"
+          /usr/libexec/PlistBuddy -c "Print :CADisableMinimumFrameDurationOnPhone" "$PLIST"
 
       - name: Assert UnityFramework unchanged
         run: |

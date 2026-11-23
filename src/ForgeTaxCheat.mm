@@ -100,6 +100,15 @@ static void ForgeTaxCheatInit(void) {
                                 object:nil
                                  queue:[NSOperationQueue mainQueue]
                             usingBlock:^(NSNotification *note) { FTC_OnWindowDidBecomeKey(note); }];
+                [[NSNotificationCenter defaultCenter]
+                    addObserverForName:UIApplicationWillEnterForegroundNotification
+                                object:nil
+                                 queue:[NSOperationQueue mainQueue]
+                            usingBlock:^(NSNotification *note) {
+                    @try {
+                        if (s_menuView) [s_menuView onAppEnteredForeground];
+                    } @catch (...) {}
+                }];
                 FTC_AttachIfPossible(nil);
                 if (!s_menuView || !s_menuView.superview) {
                     // Light retry: 1s interval, stops on attach or after
