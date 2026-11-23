@@ -25,10 +25,20 @@ const char *FTC_CallResultMessageLang(FTC_CallResult r, bool english);
 bool FTC_BridgeReady(void);
 bool FTC_ToolsAvailable(void);
 
-// #4: 0 = OFF (Normal), 1 = Success 100% (AlwaysSuccess), 2 = Great 100% (altarForced=5 + AlwaysSuccess)
+// #4: 0 = OFF, 1 = Hold 100% (Giữ nguyên), 2 = Success 100% (Thành công), 3 = Great 100% (Đại thành công)
 FTC_CallResult FTC_SetForgeWinMode(int mode);
-// Light keep-alive called only while #4 Great mode is ON (re-applies altarForced=5 if a new round cleared it).
-void FTC_KeepGreatForgeAlive(void);
+// Light keep-alive called only while #4 mode 1..3 is ON.
+void FTC_KeepForgeModeAlive(int mode);
+
+// #10: Auto-refill Fever bar immediately when Fever expires (0 work while running or full).
+void FTC_TickAutoFever(void);
+
+// #44: Live ticket deck counts [Destruction, Damage, Hold, Success, Great] + cut count & CutTicket(-1).
+FTC_CallResult FTC_GetTicketDeckCounts(int outCounts[5], int outCut[5]);
+FTC_CallResult FTC_CutTicket(int outcome);
+
+// #39 non-JIT fallback: writes effects.multiplier on current anvil sword.
+FTC_CallResult FTC_SetSwordValueMultiplierLive(double mult);
 
 // Deterministic dragon god mode (works without JIT via DeveloperOverrides.set_DragonGodMode).
 FTC_CallResult FTC_SetDragonGodMode(bool enabled);

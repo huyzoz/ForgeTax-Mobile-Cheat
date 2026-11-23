@@ -29,8 +29,8 @@ const char *FTC_PatchResultMessageLang(FTC_PatchResult r, bool english) {
             case FTC_PATCH_ERR_NOT_APPLYABLE: return "Patch disabled (unverified entry)";
             case FTC_PATCH_ERR_MISMATCH: return "Original bytes mismatch — refused (wrong game version)";
             case FTC_PATCH_ERR_ALREADY: return "Already in desired state";
-            case FTC_PATCH_ERR_PROTECT: return "Memory protection failed (needs JIT)";
-            case FTC_PATCH_ERR_NO_JIT: return "Open game via 'Open with JIT' in TrollStore";
+            case FTC_PATCH_ERR_PROTECT: return "Memory protection failed (requires Open with JIT)";
+            case FTC_PATCH_ERR_NO_JIT: return "requires opening the game with \"Open with JIT\"";
             default: return "Unknown error";
         }
     }
@@ -40,8 +40,8 @@ const char *FTC_PatchResultMessageLang(FTC_PatchResult r, bool english) {
         case FTC_PATCH_ERR_NOT_APPLYABLE: return "Patch này bị vô hiệu hóa";
         case FTC_PATCH_ERR_MISMATCH: return "Bytes gốc không khớp — từ chối ghi (sai bản 3.16.1)";
         case FTC_PATCH_ERR_ALREADY: return "Trạng thái đã đúng rồi";
-        case FTC_PATCH_ERR_PROTECT: return "Không đổi được quyền bộ nhớ (cần JIT)";
-        case FTC_PATCH_ERR_NO_JIT: return "Cần mở game bằng 'Open with JIT' trong TrollStore";
+        case FTC_PATCH_ERR_PROTECT: return "Không đổi được quyền bộ nhớ (cần Open with JIT)";
+        case FTC_PATCH_ERR_NO_JIT: return "cần mở game bằng \"Open with JIT\"";
         default: return "Lỗi không rõ";
     }
 }
@@ -215,6 +215,61 @@ FTC_PatchResult FTC_PatchApplyFeature(int featureId) {
 FTC_PatchResult FTC_PatchRemoveFeature(int featureId) {
     @try {
         return FTC_ApplyOrRemoveFeature(featureId, false);
+    } @catch (...) {
+        return FTC_PATCH_ERR_PROTECT;
+    }
+}
+
+// #39 SwordValuation.Value multiplier:
+//   0x276f380: orig ldr d1,[x21,#0x158] (a1 ae 40 fd)
+//   0x276f38c: orig ldr d1,[x21,#0x160] (a1 b2 40 fd)
+//   x10: fmov d1,#10.0 (01 90 64 1e) + orig
+//   x20: fmov d1,#20.0 (01 90 66 1e) + orig
+//   x30: fmov d1,#30.0 (01 d0 67 1e) + orig
+//   x40: fmov d1,#20.0 (01 90 66 1e) + fmov d1,#2.0 (01 10 60 1e) => 20*2=40
+static FTC_PatchResult FTC_WriteKnownSite(uint8_t *addr, const uint8_t *orig,
+                                          const uint8_t *target,
+                                          const uint8_t * const *knownStates, size_t knownCount) {
+    if (memcmp(addr, target, 4) == 0) return FTC_PATCH_ERR_ALREADY;
+    bool ok = (memcmp(addr, orig, 4) == 0);
+    for (size_t i = 0; !ok && i < knownCount; i++) {
+        if (memcmp(addr, knownStates[i], 4) == 0) ok = true;
+    }
+    if (!ok) return FTC_PATCH_ERR_MISMATCH;
+    return FTC_WriteVerified(addr, addr, target, 4);
+}
+
+FTC_PatchResult FTC_PatchSwordValueMultiplier(int mult) {
+    @try {
+        if (!FTC_PatchCanModifyCode()) return FTC_PATCH_ERR_NO_JIT;
+        uintptr_t a1 = FTC_UnityAddressForRVA(0x276f380);
+        uintptr_t a2 = FTC_UnityAddressForRVA(0x276f38c);
+        if (a1 == 0 || a2 == 0) return FTC_PATCH_ERR_NO_IMAGE;
+
+        static const uint8_t kOrig1[4] = { 0xa1, 0xae, 0x40, 0xfd };
+        static const uint8_t kOrig2[4] = { 0xa1, 0xb2, 0x40, 0xfd };
+        static const uint8_t kX10[4]   = { 0x01, 0x90, 0x64, 0x1e };
+        static const uint8_t kX20[4]   = { 0x01, 0x90, 0x66, 0x1e };
+        static const uint8_t kX30[4]   = { 0x01, 0xd0, 0x67, 0x1e };
+        static const uint8_t kX2[4]    = { 0x01, 0x10, 0x60, 0x1e };
+        static const uint8_t *kKnown1[3] = { kX10, kX20, kX30 };
+        static const uint8_t *kKnown2[1] = { kX2 };
+
+        const uint8_t *t1 = kOrig1;
+        const uint8_t *t2 = kOrig2;
+        if (mult == 10)      { t1 = kX10; t2 = kOrig2; }
+        else if (mult == 20) { t1 = kX20; t2 = kOrig2; }
+        else if (mult == 30) { t1 = kX30; t2 = kOrig2; }
+        else if (mult == 40) { t1 = kX20; t2 = kX2; }
+
+        pthread_mutex_lock(&s_patchMutex);
+        FTC_PatchResult r1 = FTC_WriteKnownSite((uint8_t *)a1, kOrig1, t1, kKnown1, 3);
+        FTC_PatchResult r2 = FTC_WriteKnownSite((uint8_t *)a2, kOrig2, t2, kKnown2, 1);
+        pthread_mutex_unlock(&s_patchMutex);
+
+        if (r1 != FTC_PATCH_OK && r1 != FTC_PATCH_ERR_ALREADY) return r1;
+        if (r2 != FTC_PATCH_OK && r2 != FTC_PATCH_ERR_ALREADY) return r2;
+        return FTC_PATCH_OK;
     } @catch (...) {
         return FTC_PATCH_ERR_PROTECT;
     }

@@ -341,11 +341,12 @@ static FTC_CallResult InvokeToolsInt(const char *methodName, int value) {
     return InvokeBool(ToolsClass(), tools, methodName, 1, args);
 }
 
-// ---- #4: 2-Mode Forge Always Win (100% IL2CPP — NO JIT needed!) ----
-// mode = 0 (OFF / Normal), 1 (Success 100%), 2 (Great 100% / purple).
-// Uses DeveloperOverrides.set_ForgeMode + ForgeCampaign.altarForced (5 = GreatSuccess
-// in NewRelicRules.ApplyAltar, affecting BOTH TicketDeck.FillTicketDeck display
-// outside AND TicketDeck.Chances strike roll!) + ForgeRoom.RefreshDisplays().
+// ---- #4: 3-Mode Forge Mode (100% IL2CPP — NO JIT needed!) ----
+// mode = 0 (OFF / Normal), 1 (Hold 100% / Giữ nguyên), 2 (Success 100% / Thành công),
+//        3 (Great 100% / Đại thành công).
+// Uses DeveloperOverrides.set_ForgeMode + ForgeCampaign.altarForced (3=Hold, 4=Success,
+// 5=Great in NewRelicRules.ApplyAltar -> updates BOTH outside display and strike roll!)
+// + ForgeRoom.RefreshDisplays().
 static bool WriteCampaignAltarForced(int32_t forcedValue, bool onlyIfChanged) {
     Il2CppApi *api = Api();
     if (!api->loaded || !api->fieldSetValue) return false;
@@ -374,32 +375,180 @@ FTC_CallResult FTC_SetForgeWinMode(int mode) {
     if (!ovClass) return FTC_CALL_ERR_NO_METHOD;
 
     // DeveloperForgeMode: Normal=0, NoBreak=1, AlwaysSuccess=2.
-    int32_t forgeMode = (mode == 0) ? 0 : 2;
+    // Mode 1 (Hold) keeps Normal so AlwaysSuccess doesn't override Hold->Success.
+    // Modes 2 (Success) and 3 (Great) set AlwaysSuccess as extra protection.
+    int32_t forgeMode = (mode == 2 || mode == 3) ? 2 : 0;
     void *args[1] = { &forgeMode };
     FTC_CallResult cr = InvokeBool(ovClass, NULL, "set_ForgeMode", 1, args);
     if (cr != FTC_CALL_OK) return cr;
 
-    if (mode == 2) {
-        // Great Success 100%: altarForced = 5 -> tickets = [0,0,0,0,1.0]
-        if (!WriteCampaignAltarForced(5, false)) {
-            // Even if campaign isn't loaded yet, AlwaysSuccess is already set;
-            // keep-alive timer will apply altarForced=5 as soon as campaign loads.
-            RefreshRoomDisplaysBestEffort();
-            return FTC_CALL_OK;
-        }
-    } else {
-        WriteCampaignAltarForced(0, false);
-    }
+    int32_t altarVal = (mode >= 1 && mode <= 3) ? (int32_t)(mode + 2) : 0; // 1->3(Hold), 2->4(Succ), 3->5(Great)
+    WriteCampaignAltarForced(altarVal, false);
     RefreshRoomDisplaysBestEffort();
     return FTC_CALL_OK;
 }
 
-void FTC_KeepGreatForgeAlive(void) {
+void FTC_KeepForgeModeAlive(int mode) {
     @try {
-        if (WriteCampaignAltarForced(5, true)) {
+        if (mode < 1 || mode > 3) return;
+        int32_t target = (int32_t)(mode + 2);
+        if (WriteCampaignAltarForced(target, true)) {
             RefreshRoomDisplaysBestEffort();
         }
     } @catch (...) {}
+}
+
+// #10: Auto-Refill Fever immediately when Fever finishes (0 writes while running or full).
+void FTC_TickAutoFever(void) {
+    @try {
+        Il2CppApi *api = Api();
+        if (!api->loaded) return;
+        Il2CppObject *room = ResolveRoom();
+        if (!room) return;
+        Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+        if (!roomClass) return;
+        Il2CppObject *sword = ReadObjectField(room, roomClass, "onAnvil");
+        if (!sword) return;
+        Il2CppClass *swordClass = api->objectGetClass ? api->objectGetClass(sword) : NULL;
+        if (!swordClass) swordClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Swords", "ForgeSword");
+        if (!swordClass) return;
+
+        Il2CppField *brokenField = api->classGetField(swordClass, "broken");
+        if (brokenField) {
+            uint8_t broken = 0;
+            api->fieldGetValue(sword, brokenField, &broken);
+            if (broken != 0) return;
+        }
+        Il2CppObject *effects = ReadObjectField(sword, swordClass, "effects");
+        if (!effects) return;
+        Il2CppClass *effClass = api->objectGetClass ? api->objectGetClass(effects) : NULL;
+        if (!effClass) effClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeSwordEffects");
+        if (!effClass) return;
+
+        Il2CppField *chargeField = api->classGetField(effClass, "charge");
+        Il2CppField *untilField  = api->classGetField(effClass, "feverUntil");
+        if (!chargeField || !untilField) return;
+
+        int32_t charge = 0;
+        float feverUntil = 0.0f;
+        api->fieldGetValue(effects, chargeField, &charge);
+        api->fieldGetValue(effects, untilField, &feverUntil);
+
+        // If bar is already full (>= 10), do nothing (0 work!).
+        if (charge >= 10) return;
+
+        // Read UnityEngine.Time.get_time() to check if Fever is currently active.
+        float now = 0.0f;
+        Il2CppClass *timeClass = FindClass("UnityEngine.CoreModule.dll", "UnityEngine", "Time");
+        if (timeClass && api->objectUnbox) {
+            Il2CppMethod *getTime = api->classGetMethod(timeClass, "get_time", 0);
+            if (getTime) {
+                Il2CppObject *exc = NULL;
+                Il2CppObject *ret = api->runtimeInvoke(getTime, NULL, NULL, &exc);
+                if (!exc && ret) {
+                    float *fp = (float *)api->objectUnbox(ret);
+                    if (fp) now = *fp;
+                }
+            }
+        }
+        // While Fever is actively ticking, do NOT refill yet.
+        if (feverUntil > 0.0f && feverUntil > now) return;
+
+        // Fever just ended (or isn't active) and bar < 10 -> refill to max immediately!
+        FTC_FillFever();
+    } @catch (...) {}
+}
+
+// #44: Live ticket counts from TicketDeck.Deck(campaign) + KnifeRemoved(i)
+FTC_CallResult FTC_GetTicketDeckCounts(int outCounts[5], int outCut[5]) {
+    if (!outCounts) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppObject *campaign = ResolveCampaign();
+    if (!campaign) return FTC_CALL_ERR_NO_INSTANCE;
+
+    Il2CppClass *deckClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "TicketDeck");
+    if (!deckClass) return FTC_CALL_ERR_NO_METHOD;
+    Il2CppMethod *deckMethod = api->classGetMethod(deckClass, "Deck", 1);
+    if (!deckMethod) return FTC_CALL_ERR_NO_METHOD;
+
+    void *args[1] = { campaign };
+    Il2CppObject *exc = NULL;
+    Il2CppObject *arr = NULL;
+    @try { arr = api->runtimeInvoke(deckMethod, NULL, args, &exc); } @catch (...) { return FTC_CALL_ERR_EXCEPTION; }
+    if (exc || !arr) return FTC_CALL_ERR_EXCEPTION;
+
+    // Il2CppArray on arm64: max_length at +0x18 (size_t), double elements at +0x20.
+    uint64_t len = *(const uint64_t *)((const uint8_t *)arr + 0x18);
+    if (len < 5) return FTC_CALL_ERR_EXCEPTION;
+    const double *elems = (const double *)((const uint8_t *)arr + 0x20);
+    for (int i = 0; i < 5; i++) {
+        double v = elems[i];
+        outCounts[i] = (v > 0.0) ? (int)(v + 0.5) : 0;
+    }
+
+    if (outCut) {
+        Il2CppClass *campClass = api->objectGetClass ? api->objectGetClass(campaign) : NULL;
+        if (!campClass) campClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+        Il2CppMethod *knifeM = campClass ? api->classGetMethod(campClass, "KnifeRemoved", 1) : NULL;
+        for (int i = 0; i < 5; i++) {
+            outCut[i] = 0;
+            if (knifeM && api->objectUnbox) {
+                int32_t idx = i;
+                void *kargs[1] = { &idx };
+                Il2CppObject *kexc = NULL;
+                Il2CppObject *kret = NULL;
+                @try { kret = api->runtimeInvoke(knifeM, campaign, kargs, &kexc); } @catch (...) {}
+                if (!kexc && kret) {
+                    int32_t *ip = (int32_t *)api->objectUnbox(kret);
+                    if (ip) outCut[i] = *ip;
+                }
+            }
+        }
+    }
+    return FTC_CALL_OK;
+}
+
+FTC_CallResult FTC_CutTicket(int outcome) {
+    if (outcome < 0 || outcome > 4) return FTC_CALL_ERR_RETURNED_FALSE;
+    Il2CppApi *api = Api();
+    if (!api->loaded) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppObject *campaign = ResolveCampaign();
+    if (!campaign) return FTC_CALL_ERR_NO_INSTANCE;
+    Il2CppClass *campClass = api->objectGetClass ? api->objectGetClass(campaign) : NULL;
+    if (!campClass) campClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeCampaign");
+    if (!campClass) return FTC_CALL_ERR_NO_METHOD;
+    int32_t o = (int32_t)outcome;
+    void *args[1] = { &o };
+    FTC_CallResult cr = InvokeBool(campClass, campaign, "CutTicket", 1, args);
+    if (cr == FTC_CALL_OK) {
+        RefreshRoomDisplaysBestEffort();
+    }
+    return cr;
+}
+
+FTC_CallResult FTC_SetSwordValueMultiplierLive(double mult) {
+    Il2CppApi *api = Api();
+    if (!api->loaded || !api->fieldSetValue) return FTC_CALL_ERR_UNAVAILABLE;
+    Il2CppObject *room = ResolveRoom();
+    if (!room) return FTC_CALL_ERR_NO_INSTANCE;
+    Il2CppClass *roomClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Room", "ForgeRoom");
+    if (!roomClass) return FTC_CALL_ERR_NO_METHOD;
+    Il2CppObject *sword = ReadObjectField(room, roomClass, "onAnvil");
+    if (!sword) return FTC_CALL_ERR_RETURNED_FALSE;
+    Il2CppClass *swordClass = api->objectGetClass ? api->objectGetClass(sword) : NULL;
+    if (!swordClass) swordClass = FindClass("Assembly-CSharp.dll", "ForgeTax.Swords", "ForgeSword");
+    if (!swordClass) return FTC_CALL_ERR_NO_METHOD;
+    Il2CppObject *effects = ReadObjectField(sword, swordClass, "effects");
+    if (!effects) return FTC_CALL_ERR_RETURNED_FALSE;
+    Il2CppClass *effClass = api->objectGetClass ? api->objectGetClass(effects) : NULL;
+    if (!effClass) effClass = FindClass("ForgeTax.Rules.dll", "ForgeTax.Rules", "ForgeSwordEffects");
+    if (!effClass) return FTC_CALL_ERR_NO_METHOD;
+    Il2CppField *multField = api->classGetField(effClass, "multiplier");
+    if (!multField) return FTC_CALL_ERR_NO_METHOD;
+    api->fieldSetValue(effects, multField, &mult);
+    RefreshRoomDisplaysBestEffort();
+    return FTC_CALL_OK;
 }
 
 FTC_CallResult FTC_SetDragonGodMode(bool enabled) {

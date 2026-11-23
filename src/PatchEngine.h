@@ -36,6 +36,9 @@ bool FTC_PatchCanModifyCode(void);
 FTC_PatchResult FTC_PatchApplyFeature(int featureId);
 FTC_PatchResult FTC_PatchRemoveFeature(int featureId);
 
+// #39 Sword Value Multiplier: mult = 0 (restore original), 10, 20, 30, or 40.
+FTC_PatchResult FTC_PatchSwordValueMultiplier(int mult);
+
 // True if every site of the feature currently holds patched bytes.
 bool FTC_PatchFeatureIsApplied(int featureId);
 
